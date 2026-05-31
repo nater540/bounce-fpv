@@ -1,41 +1,34 @@
-//! truck-diag :: servo — LEDC gimbal-servo sweep, in ISOLATION from the rest of the truck node.
+//! truck-diag :: servo — gimbal-servo sweep, in ISOLATION from the rest of the truck node (Phase C: nRF52840).
 //!
-//! Builds the same 50 Hz LowSpeed LEDC timer + two channels on `servo_pan` / `servo_tilt` that truck-node uses,
-//! wraps each in `servo::Servo`, and runs a slow, visible sweep on BOTH servos: center (1500 us) -> min
-//! (1000 us) -> max (2000 us) -> center, dwelling at each waypoint and stepping smoothly between them. Each step
-//! prints the commanded pulse width over USB Serial/JTAG so the serial log mirrors what the gimbal should be doing.
+//! Builds two 50 Hz `SimplePwm` outputs (PWM0 for pan, PWM1 for tilt — one independent PWM peripheral per servo, as
+//! `nrf_adapters::PwmServoChannel` requires), wraps each in `PwmServoChannel` -> `servo::Servo`, and runs a slow,
+//! visible sweep on BOTH servos: center (1500 us) -> min (1000 us) -> max (2000 us) -> center, dwelling at each
+//! waypoint and stepping smoothly between them. Each step prints the commanded pulse width over USB-CDC (applog) so
+//! the serial log mirrors what the gimbal should be doing.
 //!
 //! GOOD: both servos sweep smoothly through their full travel and re-center, the printed pulse widths advance
 //! monotonically through each leg, and there is no buzzing/stalling at the endpoints. FAILURE / wiring signature:
-//! a servo that twitches, hums, or does not move usually means the signal pin is on the wrong GPIO, the servo is
-//! on the 3.3 V pin (too weak — see the banner warning) instead of a 5 V rail, or grounds are not common.
+//! a servo that twitches, hums, or does not move usually means the signal pin is on the wrong GPIO, the servo is on
+//! the 3.3 V pin (too weak — see the banner warning) instead of a 5 V rail, or grounds are not common.
 //!
-//! POWER WARNING (per CLAUDE.md / the overview): power the MG90S servos from a DEDICATED 5 V rail that shares
-//! ground with the C6 — NEVER the 3.3 V pin. The 3.3 V regulator cannot source the stall current and the brownout
-//! will reset the C6.
+//! POWER WARNING (per CLAUDE.md / the migration doc): power the MG90S servos from a DEDICATED 5 V rail that shares
+//! ground with the nRF — NEVER the 3.3 V pin. The 3.3 V regulator cannot source the stall current and the brownout
+//! will reset the board.
 
 #![no_std]
 #![no_main]
 
+// Pull in the shared #[panic_handler] from applog (replaces the old truck-diag lib panic handler + esp app_desc).
+use applog as _;
+
 use embassy_executor::Spawner;
+use embassy_nrf::pwm::SimplePwm;
 use embassy_time::{Duration, Timer};
-use esp_hal::clock::CpuClock;
-use esp_hal::gpio::DriveMode;
-use esp_hal::ledc::channel::config::Config as ChannelConfig;
-use esp_hal::ledc::channel::{self, ChannelIFace};
-use esp_hal::ledc::timer::config::Config as LedcTimerConfig;
-use esp_hal::ledc::timer::{self, TimerIFace};
-use esp_hal::ledc::{LSGlobalClkSource, Ledc, LowSpeed};
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::time::Rate;
-use esp_hal::timer::timg::TimerGroup;
-use esp_println::println;
+use nrf_adapters::PwmServoChannel;
 use servo::Servo;
 
-// Pull in the shared #[panic_handler] + esp_app_desc!() (defined in the crate lib so all four bins reuse them).
-use truck_diag as _;
-
-// LEDC servo timer: 50 Hz, 14-bit duty — same as truck-node so the duty math (servo::pulse_us_to_duty) matches.
+// Servo frame rate (Hz), for the banner. The actual 50 Hz timing is fixed by PwmServoChannel::servo_config (Div16
+// prescaler + 20_000-tick countertop = 20 ms), so the duty math (1 tick = 1 us) lines up with the servo crate.
 const SERVO_FREQ_HZ: u32 = 50;
 
 // Sweep waypoints (microseconds) and stepping. TODO: tune — widen toward the MG90S 400-2400 us mechanical limits
@@ -47,55 +40,46 @@ const STEP_US: u16 = 25; //  TODO: tune — smaller = smoother but slower visibl
 const STEP_DELAY: Duration = Duration::from_millis(20); //  TODO: tune — pacing between micro-steps.
 const DWELL: Duration = Duration::from_millis(800); //  TODO: tune — pause at each waypoint so motion is obvious.
 
-#[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
-  let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-  let peripherals = esp_hal::init(config);
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+  // embassy-nrf init at SoftDevice-safe interrupt priorities (GPIOTE + time-driver at P2; the SD reserves P0/P1/P4).
+  let p = applog::init_embassy_nrf();
+  // board_pins! partial-moves only the GPIO pin fields, leaving PWM0 / PWM1 / USBD on `p`.
+  let pins = board::board_pins!(p);
 
-  // board_pins! partial-moves only the GPIO pin fields, leaving LEDC / TIMG0 / SW_INTERRUPT on `peripherals`.
-  let pins = board::board_pins!(peripherals);
+  applog::init(
+    spawner,
+    p.USBD,
+    applog::UsbIdentity::new(0x1209, 0x0001, "fabulous-fpv", "truck-diag-servo", "phase-c"),
+  );
 
-  let timg0 = TimerGroup::new(peripherals.TIMG0);
-  let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-  esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+  applog::log_println!("");
+  applog::log_println!("=== truck-diag/servo: gimbal-servo sweep (nRF52840) ===");
+  applog::log_println!(
+    "pan servo on P{}.{:02} (PWM0), tilt servo on P{}.{:02} (PWM1), {} Hz",
+    board::SERVO_PAN_PORT, board::SERVO_PAN_PIN, board::SERVO_TILT_PORT, board::SERVO_TILT_PIN, SERVO_FREQ_HZ
+  );
+  applog::log_println!("POWER: drive the MG90S from a DEDICATED 5 V rail with COMMON GROUND to the nRF — NOT 3.3 V.");
+  applog::log_println!(
+    "sweep: center {}us -> min {}us -> max {}us -> center, step {}us",
+    CENTER_US, MIN_US, MAX_US, STEP_US
+  );
+  applog::log_println!("");
 
-  println!();
-  println!("=== truck-diag/servo: LEDC gimbal-servo sweep ===");
-  println!("pan servo on GPIO{}, tilt servo on GPIO{}, {} Hz", board::SERVO_PAN, board::SERVO_TILT, SERVO_FREQ_HZ);
-  println!("POWER: drive the MG90S from a DEDICATED 5 V rail with COMMON GROUND to the C6 — NOT the 3.3 V pin.");
-  println!("sweep: center {}us -> min {}us -> max {}us -> center, step {}us", CENTER_US, MIN_US, MAX_US, STEP_US);
-  println!();
+  // SD COEXISTENCE: SimplePwm is fire-and-forget (each duty is a register/DMA write; it never awaits a PWM IRQ), so
+  // PWM0/PWM1 raise no interrupt and need no priority lowering — unlike the SPIM/TWIM/UARTE bins. One PWM peripheral
+  // per servo because PwmServoChannel owns the whole SimplePwm and targets channel 0 of it.
+  let cfg = PwmServoChannel::servo_config();
+  let pan_pwm = SimplePwm::new_1ch(p.PWM0, pins.servo_pan, &cfg);
+  let tilt_pwm = SimplePwm::new_1ch(p.PWM1, pins.servo_tilt, &cfg);
 
-  // Build the shared 50 Hz LowSpeed LEDC timer + two channels exactly as truck-node's servo task does, then wrap
-  // each configured channel in servo::Servo (which snapshots max_duty and converts us -> duty for us).
-  let mut ledc = Ledc::new(peripherals.LEDC);
-  ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+  let mut pan = Servo::new(PwmServoChannel::new(pan_pwm, 0));
+  let mut tilt = Servo::new(PwmServoChannel::new(tilt_pwm, 0));
+  applog::log_println!("PWM ready: max_duty {} (1 tick = 1 us). Beginning sweep.", pan.max_duty());
+  applog::log_println!("");
 
-  let mut lstimer = ledc.timer::<LowSpeed>(timer::Number::Timer0);
-  lstimer
-    .configure(LedcTimerConfig {
-      duty: timer::config::Duty::Duty14Bit,
-      clock_source: timer::LSClockSource::APBClk,
-      frequency: Rate::from_hz(SERVO_FREQ_HZ),
-    })
-    .expect("LEDC timer configure");
-
-  let mut pan_ch = ledc.channel::<LowSpeed>(channel::Number::Channel0, pins.servo_pan);
-  pan_ch
-    .configure(ChannelConfig { timer: &lstimer, duty_pct: 0, drive_mode: DriveMode::PushPull })
-    .expect("LEDC pan channel configure");
-  let mut tilt_ch = ledc.channel::<LowSpeed>(channel::Number::Channel1, pins.servo_tilt);
-  tilt_ch
-    .configure(ChannelConfig { timer: &lstimer, duty_pct: 0, drive_mode: DriveMode::PushPull })
-    .expect("LEDC tilt channel configure");
-
-  let mut pan = Servo::new(pan_ch);
-  let mut tilt = Servo::new(tilt_ch);
-  println!("LEDC ready: max_duty {} (14-bit). Beginning sweep.", pan.max_duty());
-  println!();
-
-  // The sweep legs, in order: home to center, down to min, up across to max, then back to center. Each leg ramps
-  // in STEP_US increments with a short pace, then dwells so the eye can register the endpoint.
+  // The sweep legs, in order: home to center, down to min, up across to max, then back to center. Each leg ramps in
+  // STEP_US increments with a short pace, then dwells so the eye can register the endpoint.
   loop {
     sweep_leg(&mut pan, &mut tilt, CENTER_US, CENTER_US).await;
     Timer::after(DWELL).await;
@@ -110,13 +94,13 @@ async fn main(_spawner: Spawner) -> ! {
 
 /// Ramps both servos from `from_us` to `to_us` in STEP_US steps (direction-aware), driving pan and tilt to the same
 /// width each step and printing the commanded pulse so the serial log tracks the visible motion. Generic over the
-/// concrete LEDC channel type so a single helper drives both Servo instances.
+/// concrete PWM channel type so a single helper drives both Servo instances.
 async fn sweep_leg<C>(pan: &mut Servo<C>, tilt: &mut Servo<C>, from_us: u16, to_us: u16)
 where
   C: embedded_hal::pwm::SetDutyCycle,
 {
-  // Step toward the target in either direction, inclusive of the endpoint, clamping the final partial step so we
-  // land exactly on `to_us` rather than overshooting by a fraction of STEP_US.
+  // Step toward the target in either direction, inclusive of the endpoint, clamping the final partial step so we land
+  // exactly on `to_us` rather than overshooting by a fraction of STEP_US.
   if to_us >= from_us {
     let mut us = from_us;
     loop {
@@ -140,17 +124,17 @@ where
   }
 }
 
-/// Commands both servos to the same pulse width and logs it. set_pulse_us drives a raw pulse (the sweep stays
-/// within 1000-2000 us by construction); a duty error is logged rather than panicked so the sweep keeps running.
+/// Commands both servos to the same pulse width and logs it. set_pulse_us drives a raw pulse (the sweep stays within
+/// 1000-2000 us by construction); a duty error is logged rather than panicked so the sweep keeps running.
 fn drive<C>(pan: &mut Servo<C>, tilt: &mut Servo<C>, us: u16)
 where
   C: embedded_hal::pwm::SetDutyCycle,
 {
-  println!("pulse {} us", us);
+  applog::log_println!("pulse {} us", us);
   if pan.set_pulse_us(us).is_err() {
-    println!("pan servo duty error");
+    applog::log_println!("pan servo duty error");
   }
   if tilt.set_pulse_us(us).is_err() {
-    println!("tilt servo duty error");
+    applog::log_println!("tilt servo duty error");
   }
 }

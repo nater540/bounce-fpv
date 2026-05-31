@@ -13,7 +13,7 @@
 
 use core::fmt::Write as _;
 use embedded_graphics::mono_font::ascii::FONT_6X10;
-use embedded_graphics::mono_font::MonoTextStyleBuilder;
+use embedded_graphics::mono_font::{MonoTextStyle, MonoTextStyleBuilder};
 use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::text::{Baseline, Text};
@@ -48,9 +48,17 @@ pub fn cm_s_to_kmh(cm_s: u32) -> u32 {
   ((cm_s as u64 * 36 + 500) / 1000) as u32
 }
 
+/// The mono text style used for every status line. Built once as a `const` rather than rebuilt per `render`
+/// (the builder does real work each call), since the truck drives `render` at 50-100 Hz on the shared bus.
+const TEXT_STYLE: MonoTextStyle<'static, BinaryColor> =
+  MonoTextStyleBuilder::new().font(&FONT_6X10).text_color(BinaryColor::On).build();
+
 /// A ready-to-use status OLED wrapping a buffered async SSD1306 on the shared I2C bus.
 pub struct StatusDisplay<I: I2c> {
   display: OledDisplay<I>,
+  // The last status actually drawn/flushed, used to skip the clear+draw+flush when nothing changed. `None`
+  // before the first render forces an initial draw regardless of the incoming status.
+  last: Option<Status>,
 }
 
 impl<I: I2c> StatusDisplay<I> {
@@ -61,29 +69,37 @@ impl<I: I2c> StatusDisplay<I> {
     let mut display =
       Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_buffered_graphics_mode();
     display.init().await?;
-    Ok(Self { display })
+    Ok(Self { display, last: None })
   }
 
   /// Clears the buffer, draws the status lines, and flushes to the panel over I2C. Three lines: a title, the
   /// link/fix indicators, and the speed in km/h. Drawing into the buffer is infallible; only `flush` can fail.
+  ///
+  /// Dirty-checked: if `status` equals the last rendered status, this returns immediately without clearing,
+  /// redrawing, or flushing — so a fixed-rate render loop only touches the I2C bus when something changed.
   pub async fn render(&mut self, status: Status) -> Result<(), display_interface::DisplayError> {
-    let style = MonoTextStyleBuilder::new().font(&FONT_6X10).text_color(BinaryColor::On).build();
+    if self.last == Some(status) {
+      return Ok(());
+    }
 
     self.display.clear_buffer();
 
     // Line 1: title. Line 2: link + fix flags. Line 3: speed in km/h. `unwrap` on draw is safe — the buffered
     // target's error type is `Infallible`.
-    Text::with_baseline("FPV HEAD TRACK", Point::zero(), style, Baseline::Top).draw(&mut self.display).unwrap();
+    Text::with_baseline("FPV HEAD TRACK", Point::zero(), TEXT_STYLE, Baseline::Top).draw(&mut self.display).unwrap();
 
     let mut flags: String<24> = String::new();
     let _ = write!(flags, "LINK:{} FIX:{}", yn(status.link_up), yn(status.gps_fix));
-    Text::with_baseline(&flags, Point::new(0, 16), style, Baseline::Top).draw(&mut self.display).unwrap();
+    Text::with_baseline(&flags, Point::new(0, 16), TEXT_STYLE, Baseline::Top).draw(&mut self.display).unwrap();
 
     let mut speed: String<24> = String::new();
     let _ = write!(speed, "SPD: {} km/h", cm_s_to_kmh(status.speed_cm_s));
-    Text::with_baseline(&speed, Point::new(0, 32), style, Baseline::Top).draw(&mut self.display).unwrap();
+    Text::with_baseline(&speed, Point::new(0, 32), TEXT_STYLE, Baseline::Top).draw(&mut self.display).unwrap();
 
-    self.display.flush().await
+    // Record the rendered status only after a successful flush, so a failed flush re-renders next call.
+    self.display.flush().await?;
+    self.last = Some(status);
+    Ok(())
   }
 
   /// Borrows the underlying buffered display for direct embedded-graphics drawing.

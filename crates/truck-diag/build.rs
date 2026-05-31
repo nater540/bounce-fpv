@@ -1,48 +1,21 @@
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+// Standard cortex-m-rt linker setup, identical to nrf-spike/applog: copy the workspace-root memory.x into OUT_DIR and
+// add OUT_DIR to the linker search path so link.x (pulled in by -Tlink.x in .cargo/config.toml) can INCLUDE it. This
+// build.rs is per-crate and so covers all four binaries under src/bin/. No -Tlinkall.x (esp-hal only); no -Tdefmt.x
+// either — none of these four bins link lora-phy, so nothing pulls defmt in (unlike lora-ping).
 fn main() {
-  linker_be_nice();
-  // Keep linkall.x last so esp-hal's memory layout wins over anything earlier. This build.rs is per-crate and so
-  // covers all four binaries under src/bin/.
-  println!("cargo:rustc-link-arg=-Tlinkall.x");
-}
-
-// Registers a small error-handling script with the linker so common undefined-symbol
-// failures (missing linker script, missing esp-rtos scheduler, etc.) print an actionable
-// hint instead of a raw symbol name. Copied from the esp-generate template.
-fn linker_be_nice() {
-  let args: Vec<String> = std::env::args().collect();
-  if args.len() > 1 {
-    let kind = &args[1];
-    let what = &args[2];
-
-    match kind.as_str() {
-      "undefined-symbol" => match what.as_str() {
-        what if what.starts_with("_defmt_") => {
-          eprintln!();
-          eprintln!("`defmt` not found - add defmt.x as a linker script and `use defmt_rtt as _;`");
-          eprintln!();
-        }
-        "_stack_start" => {
-          eprintln!();
-          eprintln!("Is the linker script `linkall.x` missing?");
-          eprintln!();
-        }
-        what if what.starts_with("esp_rtos_") => {
-          eprintln!();
-          eprintln!("esp-rtos scheduler not initialized - call esp_rtos::start(...) before spawning.");
-          eprintln!();
-        }
-        _ => (),
-      },
-      _ => {
-        std::process::exit(1);
-      }
-    }
-
-    std::process::exit(0);
-  }
-
-  println!(
-    "cargo:rustc-link-arg=--error-handling-script={}",
-    std::env::current_exe().unwrap().display()
-  );
+  let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+  // memory.x lives at the workspace root, two levels up from this crate (crates/truck-diag/).
+  let memory_x = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+    .join("..")
+    .join("..")
+    .join("memory.x");
+  fs::copy(&memory_x, out.join("memory.x")).expect("failed to copy memory.x into OUT_DIR");
+  println!("cargo:rustc-link-search={}", out.display());
+  // Re-run if the layout changes so a memory.x edit during on-target confirmation is picked up.
+  println!("cargo:rerun-if-changed={}", memory_x.display());
+  println!("cargo:rerun-if-changed=build.rs");
 }

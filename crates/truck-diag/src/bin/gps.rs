@@ -1,13 +1,16 @@
-//! truck-diag :: gps — UART NMEA reader, in ISOLATION from the rest of the truck node.
+//! truck-diag :: gps — UART NMEA reader, in ISOLATION from the rest of the truck node (Phase C: nRF52840).
 //!
-//! Default (parsed) mode: opens UART1 at 9600 baud on `gps_tx` / `gps_rx`, wraps it in `gps::GpsReader`, loops
+//! Default (parsed) mode: opens UARTE1 RX-only at 9600 baud on `gps_rx` via embassy-nrf's interrupt-driven
+//! `BufferedUarteRx`, feeds it straight into `gps::GpsReader` (it natively impls `embedded_io_async::Read`), loops
 //! `next_fix`, and prints ground speed (cm/s), the derived km/h, satellite count, and fix quality. This validates
 //! the hand-rolled NMEA parser against a real module end to end.
 //!
-//! Raw mode (`--features gps-raw`, default OFF): skips the parser entirely and echoes the incoming UART bytes to
-//! the console. This is the CRITICAL distinguisher when no fixes appear — it shows whether bytes are even arriving
-//! and whether they look like NMEA sentences, separating a wiring/baud fault (no bytes, or garbage) from a parser
-//! fault (clean `$G...` sentences but no parsed fix).
+//! Raw mode (`--features gps-raw`, default OFF): skips the parser entirely and echoes the incoming UART bytes to the
+//! console. This is the CRITICAL distinguisher when no fixes appear — it shows whether bytes are even arriving and
+//! whether they look like NMEA sentences, separating a wiring/baud fault (no bytes, or garbage) from a parser fault
+//! (clean `$G...` sentences but no parsed fix). `BufferedUarteRx` honors short reads — it returns the bytes already
+//! ring-buffered instead of blocking for a full buffer — so raw mode now streams bytes as they arrive rather than
+//! stalling until a whole chunk lands (the bug that defeated the old whole-buffer `UarteReadAdapter`).
 //!
 //! GOOD (parsed): once the module has a fix, lines print rising satellite counts, fix quality 1+, and a plausible
 //! speed (near 0 at rest). GOOD (raw): readable `$GPGGA,... / $GPRMC,...` sentences scroll by. FAILURE / wiring
@@ -17,100 +20,123 @@
 #![no_std]
 #![no_main]
 
+// Pull in the shared #[panic_handler] from applog (replaces the old truck-diag lib panic handler + esp app_desc).
+use applog as _;
+
 use embassy_executor::Spawner;
-use esp_hal::clock::CpuClock;
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::timer::timg::TimerGroup;
-use esp_hal::uart::{Config as UartConfig, Uart};
-use esp_println::println;
+use embassy_nrf::buffered_uarte::{self, BufferedUarteRx};
+use embassy_nrf::interrupt::{InterruptExt, Priority};
+use embassy_nrf::uarte::{self, Baudrate};
+use embassy_nrf::{bind_interrupts, interrupt, peripherals};
+use static_cell::StaticCell;
 
-// Pull in the shared #[panic_handler] + esp_app_desc!() (defined in the crate lib so all four bins reuse them).
-use truck_diag as _;
+// Bind ONLY the UARTE1 interrupt this binary uses (the GPS UART on UARTE1). It MUST be the buffered-UARTE handler,
+// not the plain `uarte::InterruptHandler` — `BufferedUarteRx` services its ring buffer from this ISR. USBD is bound
+// by applog — do NOT bind it here.
+bind_interrupts!(struct Irqs {
+  UARTE1 => buffered_uarte::InterruptHandler<peripherals::UARTE1>;
+});
 
-// Most NMEA modules default to 9600 baud. TODO: confirm against the specific receiver (some default to 38400/115200).
-const GPS_BAUD: u32 = 9_600;
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+  // embassy-nrf init at SoftDevice-safe interrupt priorities (GPIOTE + time-driver at P2; the SD reserves P0/P1/P4).
+  let p = applog::init_embassy_nrf();
+  // board_pins! partial-moves only the GPIO pin fields, leaving the controller singletons (UARTE1, TIMER1, the PPI
+  // channels/group BufferedUarteRx needs, USBD) on `p`.
+  let pins = board::board_pins!(p);
 
-#[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
-  let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-  let peripherals = esp_hal::init(config);
+  // SD COEXISTENCE: BufferedUarteRx::new enables the UARTE1 interrupt but does NOT set its NVIC priority (it defaults
+  // to P0, which the SoftDevice reserves and would fault on). Lower it to P2 BEFORE constructing. CONFIRM ON-TARGET.
+  interrupt::UARTE1.set_priority(Priority::P2);
 
-  // board_pins! partial-moves only the GPIO pin fields, leaving UART1 / TIMG0 / SW_INTERRUPT on `peripherals`.
-  let pins = board::board_pins!(peripherals);
+  applog::init(
+    spawner,
+    p.USBD,
+    applog::UsbIdentity::new(0x1209, 0x0001, "fabulous-fpv", "truck-diag-gps", "phase-c"),
+  );
 
-  let timg0 = TimerGroup::new(peripherals.TIMG0);
-  let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-  esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
-
-  println!();
-  println!("=== truck-diag/gps: UART NMEA reader ===");
-  println!("UART TX GPIO{} (config only), RX GPIO{} (module's NMEA), {} baud", board::GPS_TX, board::GPS_RX, GPS_BAUD);
-  println!("NOTE: a GPS needs OPEN SKY for a fix; speed is only meaningful with a fix.");
+  applog::log_println!("");
+  applog::log_println!("=== truck-diag/gps: UART NMEA reader (nRF52840) ===");
+  applog::log_println!(
+    "UARTE1 TX P{}.{:02} (config only), RX P{}.{:02} (module's NMEA), 9600 baud",
+    board::GPS_TX_PORT, board::GPS_TX_PIN, board::GPS_RX_PORT, board::GPS_RX_PIN
+  );
+  applog::log_println!("NOTE: a GPS needs OPEN SKY for a fix; speed is only meaningful with a fix.");
   #[cfg(feature = "gps-raw")]
-  println!("MODE: RAW byte echo (gps-raw) — printing incoming UART bytes, NOT parsing. Look for readable $G... lines.");
+  applog::log_println!("MODE: RAW byte echo (gps-raw) — printing UART bytes, NOT parsing. Look for $G... lines.");
   #[cfg(not(feature = "gps-raw"))]
-  println!("MODE: parsed — printing speed/sats/fix. If nothing prints, re-flash with `--features gps-raw`.");
-  println!();
+  applog::log_println!("MODE: parsed — printing speed/sats/fix. If nothing prints, re-flash with --features gps-raw.");
+  applog::log_println!("");
 
-  // GPS UART on UART1 (UART0 backs the console). RX carries the NMEA stream into the C6; TX is config-only and
-  // unused by the reader. Built blocking then converted to async, exactly as the truck node does.
-  let uart = Uart::new(peripherals.UART1, UartConfig::default().with_baudrate(GPS_BAUD))
-    .expect("UART1 config")
-    .with_rx(pins.gps_rx)
-    .with_tx(pins.gps_tx)
-    .into_async();
+  // GPS UART on UARTE1, RX-only. Most NMEA modules default to 9600 baud — TODO: confirm against the specific receiver
+  // (some default to 38400/115200). `BufferedUarteRx` is interrupt-driven and ring-buffers RX bytes between reads, so
+  // it never drops bytes mid-parse and honors short reads — exactly what `gps::GpsReader` (an `embedded_io_async::Read`
+  // consumer) wants. It needs a TIMER + two PPI channels + a PPI group for its DMA/EasyDMA hand-off; we use TIMER1
+  // (NOT TIMER0, which the SoftDevice reserves) and PPI_CH0/PPI_CH1/PPI_GROUP0, all SD-safe and otherwise unused by
+  // this isolated diagnostic. The RX ring buffer must be a `'static mut [u8]` of EVEN length; a StaticCell gives it a
+  // 'static home. The module's TX pin (`pins.gps_tx`) is intentionally unused — the reader never transmits.
+  let mut config = uarte::Config::default();
+  config.baudrate = Baudrate::BAUD9600;
+
+  // 256-byte (EVEN) RX ring: comfortably larger than a single ~82-byte NMEA sentence, so a burst of sentences between
+  // reads is absorbed without overrun even while the parser is busy.
+  static RX_RING: StaticCell<[u8; 256]> = StaticCell::new();
+  let rx_ring = RX_RING.init([0u8; 256]);
+
+  let rx = BufferedUarteRx::new(
+    p.UARTE1, p.TIMER1, p.PPI_CH0, p.PPI_CH1, p.PPI_GROUP0, Irqs, pins.gps_rx, config, rx_ring,
+  );
 
   #[cfg(feature = "gps-raw")]
-  raw_loop(uart).await;
+  raw_loop(rx).await;
   #[cfg(not(feature = "gps-raw"))]
-  parsed_loop(uart).await;
+  parsed_loop(rx).await;
 }
 
-/// Parsed mode: feed the UART into gps::GpsReader and print each completed speed fix with its satellite/fix info.
-/// This is the real validation of the NMEA parser against live data.
+/// Parsed mode: feed the UART RX into gps::GpsReader and print each completed speed fix with its satellite/fix info.
+/// This is the real validation of the NMEA parser against live data. Never returns.
 #[cfg(not(feature = "gps-raw"))]
-async fn parsed_loop(uart: Uart<'static, esp_hal::Async>) -> ! {
+async fn parsed_loop(rx: BufferedUarteRx<'static>) -> ! {
   use gps::GpsReader;
 
-  let mut reader = GpsReader::new(uart);
+  let mut reader = GpsReader::new(rx);
   loop {
     match reader.next_fix().await {
       Ok(fix) => {
         let kmh = display::cm_s_to_kmh(fix.speed_cm_s);
         let sats = fix.satellites.map(|s| s as u32).unwrap_or(0);
         let quality = fix.fix.map(|f| f.raw as u32).unwrap_or(0);
-        println!("speed {} cm/s ({} km/h) | sats {} | fix quality {}", fix.speed_cm_s, kmh, sats, quality);
+        applog::log_println!("speed {} cm/s ({} km/h) | sats {} | fix quality {}", fix.speed_cm_s, kmh, sats, quality);
       }
       // A UART read error (framing/overrun) is transient; pace retries so a wiring fault does not spin the console hot.
       Err(_) => {
-        println!("UART read error — check RX wiring + baud (try `--features gps-raw` to see raw bytes)");
+        applog::log_println!("UART read error — check RX wiring + baud (try `--features gps-raw` to see raw bytes)");
         embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
       }
     }
   }
 }
 
-/// Raw mode: read straight off the async UART and echo bytes so a wiring/baud problem (no bytes / garbage) is
-/// distinguishable from a parser problem (clean sentences, no parsed fix). Prints each chunk as it arrives.
+/// Raw mode: read straight off the UART RX and echo bytes so a wiring/baud problem (no bytes / garbage) is
+/// distinguishable from a parser problem (clean sentences, no parsed fix). `BufferedUarteRx::read` honors short
+/// reads — it returns whatever bytes are already ring-buffered rather than blocking for a full buffer — so each
+/// chunk prints as it arrives, streaming the live NMEA feed instead of stalling until 32 bytes land. Never returns.
 #[cfg(feature = "gps-raw")]
-async fn raw_loop(mut uart: Uart<'static, esp_hal::Async>) -> ! {
-  use embedded_io_async::Read;
-
-  let mut buf = [0u8; 64];
+async fn raw_loop(mut rx: BufferedUarteRx<'static>) -> ! {
+  // `BufferedUarteRx::read` is an inherent method, so no `embedded_io_async::Read` import is needed in raw mode
+  // (the trait is what `gps::GpsReader` consumes internally in the parsed path).
+  let mut buf = [0u8; 32];
   loop {
-    // Call the async-trait read explicitly: esp-hal's Uart has an inherent blocking `read` that would otherwise
-    // shadow the embedded_io_async::Read method (which is what GpsReader uses in parsed mode).
-    match Read::read(&mut uart, &mut buf).await {
-      Ok(0) => {} //  no data yet — keep awaiting.
+    match rx.read(&mut buf).await {
+      Ok(0) => {} //  empty buffer fast-path — never hit here (buf is non-empty); keep awaiting.
       Ok(n) => {
         // Echo the raw bytes as a lossy UTF-8 view so NMEA sentences are readable while non-ASCII garbage (wrong
-        // baud) still shows up as replacement characters rather than being hidden.
+        // baud) still shows up as a marker rather than being hidden.
         let text = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8 bytes — wrong baud?>");
-        esp_println::print!("{}", text);
+        applog::log_println!("{}", text);
       }
       Err(_) => {
-        println!();
-        println!("UART read error — check RX wiring + baud");
+        applog::log_println!("UART read error — check RX wiring + baud");
         embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;
       }
     }

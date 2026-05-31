@@ -3,20 +3,21 @@ name = "ppm-diag"
 version.workspace = true
 edition.workspace = true
 
-# Phase 0 diagnostic binary. Decodes the Skyzone PPM frame and prints per-channel
-# pulse widths + channel count over the C6's built-in USB Serial/JTAG. Build/run this
-# first to confirm channel count, pulse-width range, sync-gap length, and pan/tilt indices.
-# Optional inverted-PPM path. Enable only when an INVERTING buffer (e.g. 74LVC1G14) sits ahead of GPIO2, flipping the
-# line to idle-high with falling-edge-positioned pulses. Default OFF matches the bare series-resistor wiring.
+# Phase 0 diagnostic binary (Phase C: nRF52840). Decodes the Skyzone PPM frame with the shared ppm-decoder crate
+# and prints per-channel pulse widths + channel count over the Nice!Nano's USB Serial/JTAG via applog. Build/run
+# this first to confirm channel count, pulse-width range, sync-gap length, and pan/tilt indices.
+# Optional inverted-PPM path. Enable only when an INVERTING buffer (e.g. 74LVC1G14) sits ahead of the PPM pin,
+# flipping the line to idle-high with falling-edge pulses. Default OFF matches the bare series-resistor wiring.
 [features]
 default = []
 inverted-ppm = []
 
 [dependencies]
-esp-hal = { workspace = true }
-esp-rtos = { workspace = true }
-esp-bootloader-esp-idf = { workspace = true }
-embassy-executor = { workspace = true }
+board = { workspace = true }
+applog = { workspace = true }
+ppm-decoder = { workspace = true }
+
+embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
+embassy-nrf = { workspace = true }
 embassy-time = { workspace = true }
-esp-println = { workspace = true }
-log = { workspace = true }
+cortex-m-rt = { workspace = true }

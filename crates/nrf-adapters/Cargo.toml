@@ -1,0 +1,12 @@
+[package]
+name = "nrf-adapters"
+version.workspace = true
+edition.workspace = true
+
+# Small glue crate holding the two embedded-hal/-io adapters the frozen driver crates need on nRF: a
+# SimplePwm -> embedded_hal::pwm::SetDutyCycle bridge for the `servo` crate, and a UarteRx ->
+# embedded_io_async::Read bridge for the `gps` crate. No business logic lives here.
+[dependencies]
+embassy-nrf = { workspace = true }
+embedded-hal = { workspace = true }
+embedded-io-async = { workspace = true }

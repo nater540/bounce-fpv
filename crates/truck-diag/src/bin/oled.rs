@@ -1,4 +1,4 @@
-//! truck-diag :: oled — SSD1306 status panel over the async I2C bus, in ISOLATION from the rest of the truck node.
+//! truck-diag :: oled — SSD1306 status panel over the async I2C bus, in ISOLATION from the truck node (Phase C: nRF).
 //!
 //! Builds `display::StatusDisplay` (0x3C) on the same I2C pins the truck node uses and loops `render` with
 //! deliberately changing values: a counting speed_cm_s and toggling link/fix flags, refreshed a few times a second
@@ -6,23 +6,28 @@
 //! without needing LoRa or GPS data.
 //!
 //! GOOD: the panel lights up with the "FPV HEAD TRACK" title, the LINK/FIX flags toggle Y/N, and the speed value
-//! counts up and wraps — all visibly animating. FAILURE / wiring signature: `new()` errors or the panel stays dark
-//! -> check SDA/SCL wiring, the panel address strap (0x3C vs 0x3D), and power. The bin logs that hint and parks
-//! rather than panicking, so a miswired or wrong-address panel gives a clear message.
+//! counts up and wraps — all visibly animating. FAILURE / wiring signature: `new()` errors or the panel stays dark ->
+//! check SDA/SCL wiring, the panel address strap (0x3C vs 0x3D), and power. The bin logs that hint and parks rather
+//! than panicking, so a miswired or wrong-address panel gives a clear message.
 
 #![no_std]
 #![no_main]
 
-use embassy_executor::Spawner;
-use embassy_time::{Duration, Ticker};
-use esp_hal::clock::CpuClock;
-use esp_hal::i2c::master::{Config as I2cConfig, I2c};
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::timer::timg::TimerGroup;
-use esp_println::println;
+// Pull in the shared #[panic_handler] from applog (replaces the old truck-diag lib panic handler + esp app_desc).
+use applog as _;
 
-// Pull in the shared #[panic_handler] + esp_app_desc!() (defined in the crate lib so all four bins reuse them).
-use truck_diag as _;
+use embassy_executor::Spawner;
+use embassy_nrf::interrupt::{InterruptExt, Priority};
+use embassy_nrf::twim::{self, Twim};
+use embassy_nrf::{bind_interrupts, interrupt, peripherals};
+use embassy_time::{Duration, Ticker, Timer};
+use static_cell::StaticCell;
+
+// Bind ONLY the TWISPI0 interrupt this binary uses (the shared I2C bus on TWISPI0). USBD is bound by applog — do NOT
+// bind it here.
+bind_interrupts!(struct Irqs {
+  TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>;
+});
 
 // SSD1306 default address. Some panels strap to 0x3D; the display crate drives the common 0x3C. Surface both.
 const OLED_ADDR: u8 = 0x3C;
@@ -34,45 +39,53 @@ const REFRESH: Duration = Duration::from_millis(400);
 const SPEED_WRAP_CM_S: u32 = 500;
 const SPEED_STEP_CM_S: u32 = 25;
 
-#[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
-  let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-  let peripherals = esp_hal::init(config);
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+  // embassy-nrf init at SoftDevice-safe interrupt priorities (GPIOTE + time-driver at P2; the SD reserves P0/P1/P4).
+  let p = applog::init_embassy_nrf();
+  // board_pins! partial-moves only the GPIO pin fields, leaving TWISPI0 / USBD on `p`.
+  let pins = board::board_pins!(p);
 
-  // board_pins! partial-moves only the GPIO pin fields, leaving I2C0 / TIMG0 / SW_INTERRUPT on `peripherals`.
-  let pins = board::board_pins!(peripherals);
+  // SD COEXISTENCE: Twim::new enables the TWISPI0 interrupt but does NOT set its NVIC priority (it defaults to P0,
+  // which the SoftDevice reserves and would fault on). Lower it to P2 BEFORE building the Twim. CONFIRM ON-TARGET.
+  interrupt::TWISPI0.set_priority(Priority::P2);
 
-  let timg0 = TimerGroup::new(peripherals.TIMG0);
-  let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-  esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+  applog::init(
+    spawner,
+    p.USBD,
+    applog::UsbIdentity::new(0x1209, 0x0001, "fabulous-fpv", "truck-diag-oled", "phase-c"),
+  );
 
-  println!();
-  println!("=== truck-diag/oled: SSD1306 status panel ===");
-  println!("I2C SDA GPIO{}, SCL GPIO{}, addr 0x{:02X} (0x3D on some)", board::I2C_SDA, board::I2C_SCL, OLED_ADDR);
-  println!("Watch the panel: title, toggling LINK/FIX flags, and a counting speed value.");
-  println!();
+  applog::log_println!("");
+  applog::log_println!("=== truck-diag/oled: SSD1306 status panel (nRF52840) ===");
+  applog::log_println!(
+    "I2C SDA P{}.{:02}, SCL P{}.{:02}, addr 0x{:02X} (0x3D on some)",
+    board::I2C_SDA_PORT, board::I2C_SDA_PIN, board::I2C_SCL_PORT, board::I2C_SCL_PIN, OLED_ADDR
+  );
+  applog::log_println!("Watch the panel: title, toggling LINK/FIX flags, and a counting speed value.");
+  applog::log_println!("");
 
-  // Single-device diagnostic: no shared-bus Mutex needed — esp-hal's I2c<Async> implements the embedded-hal-async I2c
-  // trait directly, which is exactly the bound display::StatusDisplay::new requires.
-  let i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
-    .expect("I2C0 config")
-    .with_sda(pins.i2c_sda)
-    .with_scl(pins.i2c_scl)
-    .into_async();
+  // Single-device diagnostic: no shared-bus Mutex needed — embassy-nrf's Twim implements the embedded-hal-async I2c
+  // trait directly, which is exactly the bound display::StatusDisplay::new requires. The TWIM tx_ram_buffer must be
+  // 'static; a StaticCell gives it that. It is only used for flash-resident TX slices (small command bytes), not the
+  // framebuffer (ssd1306 flushes from its own RAM buffer), so 16 bytes is ample.
+  static TWIM_TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
+  let tx_buf = TWIM_TX_BUF.init([0; 16]);
+  let i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, twim::Config::default(), tx_buf);
 
   let mut oled = match display::StatusDisplay::new(i2c).await {
     Ok(d) => d,
     Err(e) => {
-      println!("OLED init FAILED ({:?})", e);
-      println!("check SDA/SCL wiring + panel address (0x3C/0x3D) + power, then re-flash. Parking.");
+      applog::log_println!("OLED init FAILED ({:?})", e);
+      applog::log_println!("check SDA/SCL wiring + panel address (0x3C/0x3D) + power, then re-flash. Parking.");
       loop {
-        embassy_time::Timer::after(Duration::from_secs(3600)).await;
+        Timer::after(Duration::from_secs(3600)).await;
       }
     }
   };
 
-  println!("OLED init OK — animating status. If the panel stays dark, recheck address/power.");
-  println!();
+  applog::log_println!("OLED init OK — animating status. If the panel stays dark, recheck address/power.");
+  applog::log_println!("");
 
   // Cycle the demo values so every field visibly changes: speed counts up and wraps, and the two flags toggle on
   // alternating frames so LINK and FIX are never in lockstep (easy to confirm each independently renders).
@@ -87,7 +100,7 @@ async fn main(_spawner: Spawner) -> ! {
       gps_fix: frame % 3 == 0,
     };
     if let Err(e) = oled.render(status).await {
-      println!("OLED render error: {:?} — check SDA/SCL + power", e);
+      applog::log_println!("OLED render error: {:?} — check SDA/SCL + power", e);
     }
 
     speed_cm_s += SPEED_STEP_CM_S;

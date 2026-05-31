@@ -3,32 +3,27 @@ name = "lora-ping"
 version.workspace = true
 edition.workspace = true
 
-# Standalone LoRa link bring-up prototype (Phase-0-style diagnostic). A single binary with two roles selected by a
-# Cargo feature: default build = PINGER, `--features ponger` = PONGER. Flash one board each way; the pinger times the
-# ping->pong round trip and prints RTT + RSSI/SNR + min/avg/max + lost-packet stats, the ponger echoes and prints what
-# it heard. Validates the RFM95W/SX1276 wiring (SPI + NSS/RESET/DIO0) and measures latency at SF7/BW500/CR4-5 @ 915 MHz
-# BEFORE the full goggle<->truck path is integrated (overview Recommendation #3). Thin: the radio logic lives in
-# lora-link, the pins in board.
+# Standalone LoRa link bring-up prototype (Phase-0-style diagnostic; Phase C: nRF52840). A single binary with two
+# roles selected by a Cargo feature: default build = PINGER, `--features ponger` = PONGER. Flash one board each way;
+# the pinger times the ping->pong round trip and prints RTT + RSSI/SNR + min/avg/max + lost-packet stats over USB-CDC
+# via applog, the ponger echoes and prints what it heard. Validates the RFM95W/SX1276 wiring (SPI + NSS/RESET/DIO0)
+# and measures latency at SF7/BW500/CR4-5 @ 915 MHz before the full goggle<->truck path is integrated. Thin: the radio
+# logic lives in lora-link, the pins in board.
 [dependencies]
 board = { workspace = true }
+applog = { workspace = true }
 lora-link = { workspace = true }
 
-esp-hal = { workspace = true }
-esp-rtos = { workspace = true }
-esp-bootloader-esp-idf = { workspace = true }
-embassy-executor = { workspace = true }
+embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
+embassy-nrf = { workspace = true }
 embassy-time = { workspace = true }
 embassy-futures = { workspace = true }
-# `async` enables embedded-hal-bus's AsyncSpiDevice impl for ExclusiveDevice, which is what lets the esp-hal async SPI
-# bus + NSS satisfy lora-phy's embedded-hal-async SpiDevice bound (same as the node manifests).
+cortex-m-rt = { workspace = true }
+# `async` enables embedded-hal-bus's AsyncSpiDevice impl for ExclusiveDevice, which is what lets the embassy-nrf async
+# SPIM bus + NSS satisfy lora-phy's embedded-hal-async SpiDevice bound (same as the node manifests will).
 embedded-hal-bus = { workspace = true, features = ["async"] }
-esp-println = { workspace = true }
-log = { workspace = true }
 
 [features]
-# Role select: default (feature OFF) = PINGER; `ponger` ON = PONGER. Board variant is a pass-through feature so a flash
-# can target either layout; default is the XIAO (board's own default).
-default = ["board-xiao"]
+# Role select: default (feature OFF) = PINGER; `ponger` ON = PONGER.
+default = []
 ponger = []
-board-xiao = ["board/board-xiao"]
-board-devkit = ["board/board-devkit"]

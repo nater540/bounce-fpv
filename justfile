@@ -6,22 +6,24 @@
 # does both. All default to the Phase A `nrf-spike` binary; pass another bin name for the diagnostics/nodes.
 
 target := "thumbv7em-none-eabihf"
-# Must match memory.x FLASH ORIGIN. CONFIRMED s140 v6.1.1 on the Nice!Nano (INFO_UF2.TXT) -> 0x26000.
-flash_base := "0x26000"
+# memory.x is the SINGLE SOURCE OF TRUTH for the app flash origin (CONFIRMED s140 v6.1.1 on the Nice!Nano
+# via INFO_UF2.TXT -> 0x26000). DERIVE flash_base from its FLASH ORIGIN at parse time so the two can never
+# drift (a past mismatch left the board stuck in DFU). bin2uf2.py parses the 0x00026000 form fine (int(.,0)).
+flash_base := `sed -n 's/.*FLASH[[:space:]]*:[[:space:]]*ORIGIN[[:space:]]*=[[:space:]]*\(0x[0-9A-Fa-f]*\).*/\1/p' memory.x`
 family := "0xADA52840"  # nRF52840 UF2 family id
 reldir := "target" / target / "release"
 
 default:
   @just --list
 
-# Build a binary for the nRF target (default: the Phase A spike). Uses `-p` (package), not `--bin`: while the
-# esp-* crates still coexist mid-migration, a workspace-wide `--bin` build collides critical-section features.
-# Once Phase B1 removes the esp crates, multi-bin crates (e.g. truck-diag) can switch to `--bin`.
-build bin="nrf-spike":
-  cargo build --release -p {{bin}}
+# Build a binary for the nRF target by its bin name (default: the Phase A spike). `--bin` works workspace-wide
+# now that Phase B1 removed the esp crates (the critical-section feature collision is gone), so multi-bin
+# crates resolve too: `just flash servo` / `imu` / `oled` / `gps` pick truck-diag's bins by name.
+build bin="nrf-spike" features="":
+  cargo build --release --bin {{bin}} {{ if features != "" { "--features " + features } else { "" } }}
 
 # Build, then convert the ELF to a flashable .uf2 ({{reldir}}/<bin>.uf2).
-uf2 bin="nrf-spike": (build bin)
+uf2 bin="nrf-spike" features="": (build bin features)
   rust-objcopy -O binary "{{reldir}}/{{bin}}" "{{reldir}}/{{bin}}.bin"
   python3 scripts/bin2uf2.py "{{reldir}}/{{bin}}.bin" "{{reldir}}/{{bin}}.uf2" {{flash_base}} {{family}}
 
@@ -49,7 +51,7 @@ reboot-bootloader port="":
 # Flash: build + uf2 + copy onto the mounted UF2 bootloader volume. Button-free: if a running-app CDC port
 # is present, do the 1200-baud touch (reboot into the bootloader) and poll up to ~10s for the volume to
 # mount; if the board is already in the bootloader (no app port), skip the touch and copy straight away.
-flash bin="nrf-spike": (uf2 bin)
+flash bin="nrf-spike" features="": (uf2 bin features)
   #!/usr/bin/env bash
   set -euo pipefail
   uf2="{{reldir}}/{{bin}}.uf2"
@@ -104,7 +106,7 @@ monitor port="":
   exec screen "$port" 115200
 
 # All-in-one: flash, then open the monitor on the freshly-rebooted board (the newest port).
-flash-monitor bin="nrf-spike": (flash bin)
+flash-monitor bin="nrf-spike" features="": (flash bin features)
   #!/usr/bin/env bash
   set -euo pipefail
   echo "Waiting ~3s for the board to reboot and its CDC port to enumerate..."

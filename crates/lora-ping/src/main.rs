@@ -1,9 +1,9 @@
-//! Standalone LoRa link bring-up prototype (Phase-0-style diagnostic) for the RFM95W/SX1276.
+//! Standalone LoRa link bring-up prototype (Phase-0-style diagnostic) for the RFM95W/SX1276 (Phase C: nRF52840).
 //!
 //! This validates the radio wiring (SPI SCK/MOSI/MISO + NSS/RESET/DIO0) and measures the ping->pong round-trip
 //! latency at the link's chosen modulation (SF7 / BW 500 kHz / CR 4/5 @ 915 MHz) BEFORE the full goggle<->truck path
-//! is integrated — per the overview's Recommendation #3. It builds the exact same esp-hal async SPI + ExclusiveDevice
-//! + `build_sx1276` radio the node binaries use, so a clean run here de-risks every downstream LoRa assumption.
+//! is integrated. It builds the same embassy-nrf async SPIM + `ExclusiveDevice` + `build_sx1276` radio the node
+//! binaries will use, so a clean run here de-risks every downstream LoRa assumption.
 //!
 //! One binary, two roles selected by a Cargo feature (mirrors ppm-diag's `inverted-ppm` cfg style):
 //!   - feature OFF (default) -> PINGER: send a small seq-numbered packet, await the echo with a bounded timeout,
@@ -17,38 +17,43 @@
 //! test): bytes 0..4 = the u32 sequence counter, little-endian; byte 4 = a 1-byte magic tag (PING_MAGIC on the
 //! ping, PONG_MAGIC on the echo). The pinger validates both the echoed seq and the pong magic before counting an
 //! RTT, so a stray packet from anything else on the band cannot pollute the statistics.
+//!
+//! ## lora-phy / defmt link note (mirrored verbatim by the Phase D nodes)
+//!
+//! `lora-phy` depends on `defmt` UNCONDITIONALLY, so it emits `_defmt_*` symbols and an undefined `#[global_logger]`
+//! that the linker must resolve even though our real logging is the USB-CDC `applog` path. That linkage is now
+//! CENTRALIZED, so this crate carries no per-binary defmt bits: `applog` (a dep, pulled in via `use applog as _;`)
+//! provides the `#[global_logger]` through its own `use defmt_rtt as _;`, and `.cargo/config.toml` adds `-Tdefmt.x`
+//! globally so the `.defmt` linker section is always defined. The defmt/RTT output is never read (no probe is
+//! attached; everything human-facing goes over USB-CDC) — this purely makes the image link.
 
 #![no_std]
 #![no_main]
 
+// Pull in the shared #[panic_handler] (defined once in applog). applog ALSO provides defmt-rtt's #[global_logger]
+// (it does `use defmt_rtt as _;`), which is what lets lora-phy's unconditional defmt dependency link here without any
+// per-binary defmt setup. Replaces the old esp manual panic handler + esp_bootloader_esp_idf::esp_app_desc!() macro.
+use applog as _;
+
 use embassy_executor::Spawner;
 #[cfg(not(feature = "ponger"))]
 use embassy_futures::select::{select, Either};
+use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
+use embassy_nrf::spim::{self, Spim};
+use embassy_nrf::{bind_interrupts, interrupt, peripherals};
+use embassy_nrf::interrupt::{InterruptExt, Priority};
+use embassy_time::Delay;
 #[cfg(not(feature = "ponger"))]
 use embassy_time::Instant;
-use embassy_time::{Delay, Duration, Timer};
+use embassy_time::{Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
-use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::spi::Mode;
-use esp_hal::time::Rate;
-use esp_hal::timer::timg::TimerGroup;
-use esp_hal::Async;
-use esp_println::println;
 use lora_link::{LoraLink, Sx1276Radio};
 
-// Manual panic handler: log over USB Serial/JTAG then park. esp-rtos owns the runtime here, so we keep this minimal
-// rather than pulling in esp-backtrace (matches ppm-diag / the node binaries).
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-  println!("PANIC: {}", info);
-  loop {}
-}
-
-// App descriptor required by the esp-idf second-stage bootloader.
-esp_bootloader_esp_idf::esp_app_desc!();
+// Bind ONLY the SPIM3 interrupt this binary uses (the LoRa SPI bus on SPI3). USBD is bound by applog — do NOT bind it
+// here. GPIOTE (DIO0 edge waits) is bound by embassy-nrf's init at the SD-safe P2 priority via init_embassy_nrf.
+bind_interrupts!(struct Irqs {
+  SPIM3 => spim::InterruptHandler<peripherals::SPI3>;
+});
 
 // Operating frequency. 915 MHz is the US ISM band and matches lora-link's default. TODO: tune on hardware per your
 // region (e.g. 868 MHz in EU) — both ends must agree.
@@ -85,74 +90,75 @@ const ECHO_TIMEOUT: Duration = Duration::from_millis(150);
 #[cfg(not(feature = "ponger"))]
 const STATS_EVERY: u32 = 10;
 
-// Concrete radio type for this board: the SX1276 over an ExclusiveDevice (SPI2 async bus + NSS Output + a
+// Concrete radio type for this board: the SX1276 over an ExclusiveDevice (SPIM3 async bus + NSS Output + a
 // blocking/async `Delay`), with the RESET Output and DIO0 Input as the lora-phy interface-variant pins. Matches the
 // node binaries' aliases; this prototype runs everything in `main`, but the alias keeps the types readable.
-type RadioSpi = ExclusiveDevice<Spi<'static, Async>, Output<'static>, Delay>;
+type RadioSpi = ExclusiveDevice<Spim<'static>, Output<'static>, Delay>;
 type Radio = Sx1276Radio<RadioSpi, Output<'static>, Input<'static>>;
 type Link = LoraLink<Radio, Delay>;
 
-#[esp_rtos::main]
-async fn main(_spawner: Spawner) -> ! {
-  let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-  let peripherals = esp_hal::init(config);
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+  // embassy-nrf init at SoftDevice-safe interrupt priorities (GPIOTE + time-driver at P2; the SD reserves P0/P1/P4).
+  let p = applog::init_embassy_nrf();
+  // board_pins! partial-moves only the GPIO pin fields out of `p`, leaving the controller singletons (SPI3, USBD, ...)
+  // on `p` for the rest of main.
+  let pins = board::board_pins!(p);
 
-  // `board_pins!` partial-moves only the GPIO pin fields out of `peripherals` into BoardPins, so the binding retains
-  // the controller singletons (SPI2/TIMG0/SW_INTERRUPT/...) and we use them directly by field access.
-  let pins = board::board_pins!(peripherals);
+  // SD COEXISTENCE: Spim::new enables the SPIM3 interrupt but does NOT set its NVIC priority, which defaults to P0 —
+  // a priority the SoftDevice reserves, so a SPIM IRQ there would fault the SD. Lower it to P2 (same band as GPIOTE /
+  // the time driver) BEFORE building the Spim. CONFIRM ON-TARGET that the radio IRQ behaves with the SD enabled.
+  interrupt::SPIM3.set_priority(Priority::P2);
 
-  // esp-rtos drives Embassy off a TIMG timer + a software interrupt; this runs before any timing primitive is awaited.
-  let timg0 = TimerGroup::new(peripherals.TIMG0);
-  let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-  esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+  applog::init(
+    spawner,
+    p.USBD,
+    applog::UsbIdentity::new(0x1209, 0x0001, "fabulous-fpv", "lora-ping", "phase-c"),
+  );
 
   // Boot banner: role, radio params, and the LoRa pin assignments (surfaced from the board crate's pub consts) so the
   // serial log is self-documenting and a wiring fault is easy to cross-check against the schematic.
-  println!();
+  applog::log_println!("");
   #[cfg(not(feature = "ponger"))]
-  println!("=== lora-ping: PINGER (default build) — measures ping->pong RTT ===");
+  applog::log_println!("=== lora-ping: PINGER (default build) — measures ping->pong RTT (nRF52840) ===");
   #[cfg(feature = "ponger")]
-  println!("=== lora-ping: PONGER (--features ponger) — echoes packets back ===");
-  println!(
+  applog::log_println!("=== lora-ping: PONGER (--features ponger) — echoes packets back (nRF52840) ===");
+  applog::log_println!(
     "radio: {} Hz | SF7 | BW500kHz | CR4/5 | power {} dBm | tx_boost {}",
-    FREQUENCY_HZ, OUTPUT_POWER_DBM, TX_BOOST
+    FREQUENCY_HZ,
+    OUTPUT_POWER_DBM,
+    TX_BOOST
   );
-  println!("note: RFM95W routes PA_BOOST only — tx_boost MUST be true or output is near-zero.");
-  println!(
-    "LoRa pins: SCK=GPIO{} MOSI=GPIO{} MISO=GPIO{} NSS=GPIO{} RESET=GPIO{} DIO0=GPIO{}",
-    board::LORA_SCK, board::LORA_MOSI, board::LORA_MISO, board::LORA_NSS, board::LORA_RESET, board::LORA_DIO0
+  applog::log_println!("note: RFM95W routes PA_BOOST only — tx_boost MUST be true or output is near-zero.");
+  applog::log_println!(
+    "LoRa pins: SCK=P{}.{:02} MOSI=P{}.{:02} MISO=P{}.{:02} NSS=P{}.{:02} RESET=P{}.{:02} DIO0=P{}.{:02}",
+    board::LORA_SCK_PORT, board::LORA_SCK_PIN, board::LORA_MOSI_PORT, board::LORA_MOSI_PIN,
+    board::LORA_MISO_PORT, board::LORA_MISO_PIN, board::LORA_NSS_PORT, board::LORA_NSS_PIN,
+    board::LORA_RESET_PORT, board::LORA_RESET_PIN, board::LORA_DIO0_PORT, board::LORA_DIO0_PIN
   );
 
-  // Build the SX1276 SPI bus on SPI2 at 1 MHz, mode 0 (the SX1276 default), created blocking then converted to async.
-  // NSS/RESET are push-pull Outputs (idle high); DIO0 is the IRQ Input the RX/TX futures await. ExclusiveDevice owns
-  // the bus + NSS and toggles CS around each transfer. Identical to the node binaries' radio construction.
-  let spi_bus = Spi::new(
-    peripherals.SPI2,
-    SpiConfig::default().with_frequency(Rate::from_mhz(1)).with_mode(Mode::_0),
-  )
-  .expect("SPI2 config")
-  .with_sck(pins.lora_sck)
-  .with_mosi(pins.lora_mosi)
-  .with_miso(pins.lora_miso)
-  .into_async();
+  // Build the SX1276 SPI bus on SPI3. spim::Config defaults to 1 MHz, mode 0 (the SX1276 default), which is exactly
+  // what the radio wants. NSS/RESET are push-pull Outputs (idle high); DIO0 is the IRQ Input the RX/TX futures await.
+  // ExclusiveDevice owns the bus + NSS and toggles CS around each transfer.
+  let spi_bus = Spim::new(p.SPI3, Irqs, pins.lora_sck, pins.lora_miso, pins.lora_mosi, spim::Config::default());
 
-  let nss = Output::new(pins.lora_nss, Level::High, OutputConfig::default());
-  let reset = Output::new(pins.lora_reset, Level::High, OutputConfig::default());
-  let dio0 = Input::new(pins.lora_dio0, InputConfig::default().with_pull(Pull::None));
+  let nss = Output::new(pins.lora_nss, Level::High, OutputDrive::Standard);
+  let reset = Output::new(pins.lora_reset, Level::High, OutputDrive::Standard);
+  let dio0 = Input::new(pins.lora_dio0, Pull::None);
   let spi_dev = ExclusiveDevice::new(spi_bus, nss, Delay).expect("ExclusiveDevice");
 
   // Bring up the radio. build_sx1276 fixes SF7/BW500/CR4-5 @ 915 MHz (lora-link's defaults). On failure DO NOT panic
   // silently — log the error and park, because an error here almost always means a wiring fault (NSS/RESET/DIO0 or a
   // SPI line), which is exactly what this prototype exists to catch.
-  println!("radio init: building SX1276 ...");
+  applog::log_println!("radio init: building SX1276 ...");
   let link: Link = match lora_link::build_sx1276(spi_dev, reset, dio0, Delay, TX_BOOST).await {
     Ok(link) => {
-      println!("radio init: OK");
+      applog::log_println!("radio init: OK");
       link
     }
     Err(e) => {
-      println!("radio init: FAILED ({:?})", e);
-      println!("check SPI wiring (SCK/MOSI/MISO), NSS, RESET, DIO0, and 3.3 V power to the module. Parking.");
+      applog::log_println!("radio init: FAILED ({:?})", e);
+      applog::log_println!("check SPI wiring (SCK/MOSI/MISO), NSS, RESET, DIO0, and 3.3 V power to the radio. Parked.");
       loop {
         Timer::after(Duration::from_secs(3600)).await;
       }
@@ -168,15 +174,15 @@ async fn main(_spawner: Spawner) -> ! {
 /// PINGER role. Maintains a u32 sequence counter; for each ping it records t0, transmits the seq + PING_MAGIC, then
 /// awaits the echo bounded by ECHO_TIMEOUT. On a valid echo (matching seq, PONG_MAGIC) it computes RTT = now - t0 and
 /// prints it with the echo's RSSI/SNR; it also tracks running min/avg/max RTT and a lost count, printed every
-/// STATS_EVERY pings. A timeout prints an explicit wiring/power hint rather than deadlocking.
+/// STATS_EVERY pings. A timeout prints an explicit wiring/power hint rather than deadlocking. Never returns.
 #[cfg(not(feature = "ponger"))]
 async fn pinger(mut link: Link) -> ! {
-  println!(
+  applog::log_println!(
     "pinger: sending one ping every {} ms, echo timeout {} ms",
     PING_PERIOD.as_millis(),
     ECHO_TIMEOUT.as_millis()
   );
-  println!();
+  applog::log_println!("");
 
   let mut rx_buf = [0u8; lora_link::MAX_PAYLOAD as usize];
   let mut seq: u32 = 0;
@@ -197,7 +203,7 @@ async fn pinger(mut link: Link) -> ! {
     let t0 = Instant::now();
     if let Err(e) = link.send(&payload, OUTPUT_POWER_DBM).await {
       // A TX error is a radio/SPI problem, not a missing peer — surface it distinctly from a lost echo.
-      println!("seq {}: TX error: {:?}", seq, e);
+      applog::log_println!("seq {}: TX error: {:?}", seq, e);
       Timer::after(PING_PERIOD).await;
       seq = seq.wrapping_add(1);
       continue;
@@ -216,22 +222,23 @@ async fn pinger(mut link: Link) -> ! {
           if rtt_us > max_us {
             max_us = rtt_us;
           }
-          println!("seq {}: RTT {} us | RSSI {} dBm | SNR {} dB", seq, rtt_us, status.rssi, status.snr);
+          applog::log_println!("seq {}: RTT {} us | RSSI {} dBm | SNR {} dB", seq, rtt_us, status.rssi, status.snr);
         } else {
           // A packet arrived but it was not our echo (wrong seq or magic): count it as lost for this seq and note it.
           lost += 1;
-          println!("seq {}: stray/mismatched packet ({} bytes) — not our echo", seq, len);
+          applog::log_println!("seq {}: stray/mismatched packet ({} bytes) — not our echo", seq, len);
         }
       }
       Either::First(Err(e)) => {
         lost += 1;
-        println!("seq {}: RX error: {:?}", seq, e);
+        applog::log_println!("seq {}: RX error: {:?}", seq, e);
       }
       Either::Second(()) => {
         lost += 1;
-        println!(
+        applog::log_println!(
           "seq {}: no echo for {} ms — check ponger powered / antenna / NSS-RESET-DIO0 wiring",
-          seq, ECHO_TIMEOUT.as_millis()
+          seq,
+          ECHO_TIMEOUT.as_millis()
         );
       }
     }
@@ -239,14 +246,14 @@ async fn pinger(mut link: Link) -> ! {
     // Periodic rolling summary so link health is visible without scanning every line.
     if (seq + 1) % STATS_EVERY == 0 {
       if recv > 0 {
-        println!(
+        applog::log_println!(
           "stats: pings {} | echoes {} | lost {} | RTT min {} / avg {} / max {} us",
           seq + 1, recv, lost, min_us, sum_us / recv as u64, max_us
         );
       } else {
-        println!("stats: pings {} | echoes 0 | lost {} | no RTT yet (no valid echoes)", seq + 1, lost);
+        applog::log_println!("stats: pings {} | echoes 0 | lost {} | no RTT yet (no valid echoes)", seq + 1, lost);
       }
-      println!();
+      applog::log_println!("");
     }
 
     Timer::after(PING_PERIOD).await;
@@ -267,11 +274,11 @@ fn valid_echo(buf: &[u8], expected_seq: u32) -> bool {
 
 /// PONGER role. Parks in continuous RX; on each received packet it echoes the same payload straight back (with the
 /// magic bumped to PONG_MAGIC so the direction is visible on the wire) and prints the seq + RSSI/SNR it heard. This
-/// exercises the ponger's own RX->TX turnaround and the full SPI/NSS/RESET/DIO0 path on its board.
+/// exercises the ponger's own RX->TX turnaround and the full SPI/NSS/RESET/DIO0 path on its board. Never returns.
 #[cfg(feature = "ponger")]
 async fn ponger(mut link: Link) -> ! {
-  println!("ponger: listening, will echo every packet back with magic 0x{:02X}", PONG_MAGIC);
-  println!();
+  applog::log_println!("ponger: listening, will echo every packet back with magic 0x{:02X}", PONG_MAGIC);
+  applog::log_println!("");
 
   let mut rx_buf = [0u8; lora_link::MAX_PAYLOAD as usize];
 
@@ -279,7 +286,7 @@ async fn ponger(mut link: Link) -> ! {
     let (len, status) = match link.receive_with_status(&mut rx_buf).await {
       Ok(result) => result,
       Err(e) => {
-        println!("RX error: {:?}", e);
+        applog::log_println!("RX error: {:?}", e);
         continue;
       }
     };
@@ -288,9 +295,9 @@ async fn ponger(mut link: Link) -> ! {
     // pinger's mismatch path is exercised too, but flag it.
     if len == PAYLOAD_LEN && rx_buf[4] == PING_MAGIC {
       let seq = u32::from_le_bytes([rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]]);
-      println!("heard seq {}: RSSI {} dBm | SNR {} dB — echoing", seq, status.rssi, status.snr);
+      applog::log_println!("heard seq {}: RSSI {} dBm | SNR {} dB — echoing", seq, status.rssi, status.snr);
     } else {
-      println!(
+      applog::log_println!(
         "heard {} bytes (not a ping payload): RSSI {} dBm | SNR {} dB — echoing",
         len, status.rssi, status.snr
       );
@@ -303,7 +310,7 @@ async fn ponger(mut link: Link) -> ! {
     echo[..copy].copy_from_slice(&rx_buf[..copy]);
     echo[4] = PONG_MAGIC;
     if let Err(e) = link.send(&echo, OUTPUT_POWER_DBM).await {
-      println!("echo TX error: {:?}", e);
+      applog::log_println!("echo TX error: {:?}", e);
     }
   }
 }

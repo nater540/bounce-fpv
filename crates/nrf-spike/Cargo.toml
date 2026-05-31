@@ -17,3 +17,8 @@ cortex-m = { workspace = true }
 cortex-m-rt = { workspace = true }
 panic-halt = { workspace = true }
 static_cell = { workspace = true }
+# This throwaway Phase A spike predates applog (it uses panic-halt, not applog's panic handler), so it does NOT
+# link applog and would otherwise lack the `.defmt` linker script that the GLOBAL `-Tdefmt.x` rustflag (added
+# for the applog-linking binaries) requires. Depending on defmt here runs defmt's build.rs, which emits defmt.x
+# onto the linker search path, satisfying the global flag. No defmt macros are used, so nothing is logged.
+defmt = { workspace = true }

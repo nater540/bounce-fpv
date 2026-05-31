@@ -1,0 +1,27 @@
+[package]
+name = "applog"
+version.workspace = true
+edition.workspace = true
+
+# Shared runtime crate for the nRF52840 binaries (Phase B5). Productizes the hardware-validated Phase A
+# spike recipe: SoftDevice (s140, LFXO) + embassy-usb CDC-ACM bring-up, a `println!`-style logging facade
+# / `log` backend over the CDC port, the 1200-baud bootloader-touch + reboot-into-UF2 helper, and the
+# single workspace `#[panic_handler]`. Diagnostics (Phase C) and the nodes (Phase D) depend on this.
+[dependencies]
+embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = { workspace = true }
+embassy-nrf = { workspace = true }
+embassy-usb = { workspace = true }
+embassy-futures = { workspace = true }
+embassy-sync = { workspace = true }
+nrf-softdevice = { workspace = true }
+nrf-softdevice-s140 = { workspace = true }
+cortex-m = { workspace = true }
+static_cell = { workspace = true }
+log = { workspace = true }
+# CENTRALIZED defmt linkage for the whole image. lora-phy depends on defmt unconditionally and needs a
+# #[global_logger] + the .defmt section; since every nRF binary links applog, providing defmt-rtt's logger
+# here (via `use defmt_rtt as _;` in lib.rs) plus `-Tdefmt.x` in the GLOBAL rustflags satisfies it for all
+# binaries, so no binary needs its own defmt deps / build.rs handling. The RTT sink is never read (no probe).
+defmt = { workspace = true }
+defmt-rtt = { workspace = true }

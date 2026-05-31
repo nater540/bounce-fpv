@@ -1,23 +1,10 @@
-//! Shared boot scaffolding for the truck-diag binaries. Each bin under `src/bin/` is its own `#![no_std]`
-//! `#![no_main]` artifact, but the `#[panic_handler]` and the esp-idf app descriptor are identical across all
-//! four — defining them ONCE here (a lib crate the bins depend on) means every bin artifact links these in
-//! without four copies. A `#[panic_handler]` in a linked rlib satisfies each downstream binary.
+//! truck-diag: truck-node peripheral bring-up diagnostics (Phase C: nRF52840). ONE crate, FOUR binaries under
+//! `src/bin/` — `servo`, `imu`, `oled`, `gps` — each exercising ONE peripheral in isolation.
 //!
-//! This crate is `no_std` itself so it links cleanly into the bare-metal bins. It carries no peripheral logic;
-//! that all lives in the servo / imu / display / gps driver crates the bins call directly.
+//! On the ESP32-C6 this lib carried the shared `#[panic_handler]` + esp-idf app descriptor so all four bins could
+//! reuse them. On the nRF52840 that role moved to `applog`: the single workspace `#[panic_handler]` lives there and
+//! each bin pulls it in with `use applog as _;`, so this lib no longer owns any runtime scaffolding. It is kept as an
+//! empty `#![no_std]` crate purely so the crate layout (and `-p truck-diag` / `--bin` discovery) stays unchanged; all
+//! real logic lives in the servo / imu / display / gps driver crates the bins call directly.
 
 #![no_std]
-
-use esp_println::println;
-
-// Manual panic handler: log the panic over USB Serial/JTAG then park. esp-rtos owns the runtime, so we keep the
-// handler minimal rather than pulling in esp-backtrace. Defined here so every bin artifact picks it up.
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-  println!("PANIC: {}", info);
-  loop {}
-}
-
-// App descriptor required by the esp-idf second-stage bootloader. Emitted once here; it lands in every bin that
-// links this rlib, so the four diagnostic binaries each get a valid descriptor without repeating the macro.
-esp_bootloader_esp_idf::esp_app_desc!();

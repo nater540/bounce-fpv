@@ -30,6 +30,13 @@ pub const DEFAULT_MAX_PULSE_US: u32 = 2_500;
 pub struct Frame {
   pub channels: [u16; MAX_CHANNELS],
   pub count: usize,
+  /// The measured sync-gap interval (us) that closed this frame, i.e. the `delta_us` that exceeded the sync
+  /// threshold. Reported so diagnostics print the real gap rather than the threshold constant.
+  pub sync_gap_us: u32,
+  /// True when an implausible mid-frame interval or a channel overflow corrupted this frame. A corrupt frame
+  /// is only ever returned when [`Config::emit_corrupt_frames`] is set (diagnostics); the production node
+  /// keeps the default and never sees one. The `channels`/`count` of a corrupt frame may be shifted.
+  pub corrupt: bool,
 }
 
 impl Frame {
@@ -47,11 +54,20 @@ pub struct Config {
   pub sync_gap_us: u32,
   pub min_pulse_us: u32,
   pub max_pulse_us: u32,
+  /// When true, `feed` emits frames marked `corrupt` (shifted/partial) instead of suppressing them. Default
+  /// `false` keeps the node-safe behavior: corrupt frames are dropped so the servo never jumps the wrong axis.
+  /// `ppm-diag` opts in so a jittery/noisy link still shows frames on the console rather than a dead screen.
+  pub emit_corrupt_frames: bool,
 }
 
 impl Default for Config {
   fn default() -> Self {
-    Self { sync_gap_us: DEFAULT_SYNC_GAP_US, min_pulse_us: DEFAULT_MIN_PULSE_US, max_pulse_us: DEFAULT_MAX_PULSE_US }
+    Self {
+      sync_gap_us: DEFAULT_SYNC_GAP_US,
+      min_pulse_us: DEFAULT_MIN_PULSE_US,
+      max_pulse_us: DEFAULT_MAX_PULSE_US,
+      emit_corrupt_frames: false,
+    }
   }
 }
 
@@ -78,14 +94,15 @@ impl PpmDecoder {
   /// closing an empty frame (e.g. the first one after boot) or a frame marked corrupt returns `None` instead.
   pub fn feed(&mut self, delta_us: u32) -> Option<Frame> {
     if delta_us >= self.config.sync_gap_us {
-      // Sync gap: the frame that just ended is complete. Snapshot it only if it had channels and was never
-      // marked corrupt, then reset (clearing the corrupt flag) to start accumulating the next frame.
+      // Sync gap: the frame that just ended is complete. Snapshot it if it had channels and is either clean or
+      // explicitly allowed by `emit_corrupt_frames`, then reset (clearing the corrupt flag) for the next frame.
+      // `delta_us` IS the measured sync gap, so report it on the frame for diagnostics.
       let count = self.index;
       let corrupt = self.corrupt;
       self.index = 0;
       self.corrupt = false;
-      if count > 0 && !corrupt {
-        return Some(Frame { channels: self.widths, count });
+      if count > 0 && (!corrupt || self.config.emit_corrupt_frames) {
+        return Some(Frame { channels: self.widths, count, sync_gap_us: delta_us, corrupt });
       }
       return None;
     }
@@ -131,6 +148,35 @@ mod tests {
     assert_eq!(frame.count, 6);
     assert_eq!(frame.channels[..6], [1000, 1500, 2000, 1500, 1100, 1900]);
     assert_eq!(frame.channel(4), Some(1100));
+    // A clean frame is never corrupt and reports the real gap that closed it (the 5_000 us delta), not a const.
+    assert!(!frame.corrupt);
+    assert_eq!(frame.sync_gap_us, 5_000);
+  }
+
+  #[test]
+  fn emit_corrupt_frames_surfaces_a_noisy_frame() {
+    // ppm-diag opts in: a frame with an out-of-band interval is still emitted, flagged corrupt, with the real
+    // sync gap, so a noisy link shows up on the console instead of a dead screen.
+    let cfg = Config { emit_corrupt_frames: true, ..Config::default() };
+    let mut d = PpmDecoder::new(cfg);
+    assert_eq!(d.feed(1500), None);
+    assert_eq!(d.feed(100), None); //  too short — marks the frame corrupt.
+    assert_eq!(d.feed(1600), None);
+    let frame = d.feed(4_200).expect("emit_corrupt_frames should surface the corrupt frame");
+    assert!(frame.corrupt);
+    assert_eq!(frame.sync_gap_us, 4_200);
+    assert!(frame.count > 0);
+  }
+
+  #[test]
+  fn default_config_still_suppresses_a_corrupt_frame() {
+    // The production node keeps the default Config, so a corrupt frame is still dropped (None) — behavior
+    // unchanged from before the emit_corrupt_frames flag existed.
+    let mut d = PpmDecoder::new(Config::default());
+    assert_eq!(d.feed(1500), None);
+    assert_eq!(d.feed(100), None);
+    assert_eq!(d.feed(1600), None);
+    assert_eq!(d.feed(4_000), None);
   }
 
   #[test]

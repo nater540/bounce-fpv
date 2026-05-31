@@ -33,12 +33,16 @@ pub type OledDisplay<I> =
   Ssd1306Async<I2CInterface<I>, DisplaySize128x64, BufferedGraphicsModeAsync<DisplaySize128x64>>;
 
 /// The status to render: ground speed (cm/s, matching the telemetry unit), whether the LoRa link is live,
-/// and whether the GPS has a fix. Kept small and `Copy` so the render task can pull it from a `Signal`.
+/// whether the GPS has a fix, and the lap stopwatch value in whole seconds since the last reset. Kept small
+/// and `Copy` so the render task can pull it from a `Signal`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Status {
   pub speed_cm_s: u32,
   pub link_up: bool,
   pub gps_fix: bool,
+  // Whole seconds since the last lap reset. Only changes once per second, so the dirty-check below lets the
+  // panel re-flush at ~1 Hz while the lap line is the only thing moving — well within the bus budget.
+  pub lap_secs: u32,
 }
 
 /// Converts centimeters/second to whole km/h with integer rounding. 1 cm/s = 0.036 km/h, so km/h =
@@ -72,8 +76,9 @@ impl<I: I2c> StatusDisplay<I> {
     Ok(Self { display, last: None })
   }
 
-  /// Clears the buffer, draws the status lines, and flushes to the panel over I2C. Three lines: a title, the
-  /// link/fix indicators, and the speed in km/h. Drawing into the buffer is infallible; only `flush` can fail.
+  /// Clears the buffer, draws the status lines, and flushes to the panel over I2C. Four lines: a title, the
+  /// link/fix indicators, the speed in km/h, and the lap timer in seconds. Drawing into the buffer is
+  /// infallible; only `flush` can fail.
   ///
   /// Dirty-checked: if `status` equals the last rendered status, this returns immediately without clearing,
   /// redrawing, or flushing — so a fixed-rate render loop only touches the I2C bus when something changed.
@@ -84,8 +89,8 @@ impl<I: I2c> StatusDisplay<I> {
 
     self.display.clear_buffer();
 
-    // Line 1: title. Line 2: link + fix flags. Line 3: speed in km/h. `unwrap` on draw is safe — the buffered
-    // target's error type is `Infallible`.
+    // Line 1: title. Line 2: link + fix flags. Line 3: speed in km/h. Line 4: lap timer in seconds. `unwrap`
+    // on draw is safe — the buffered target's error type is `Infallible`.
     Text::with_baseline("FPV HEAD TRACK", Point::zero(), TEXT_STYLE, Baseline::Top).draw(&mut self.display).unwrap();
 
     let mut flags: String<24> = String::new();
@@ -95,6 +100,10 @@ impl<I: I2c> StatusDisplay<I> {
     let mut speed: String<24> = String::new();
     let _ = write!(speed, "SPD: {} km/h", cm_s_to_kmh(status.speed_cm_s));
     Text::with_baseline(&speed, Point::new(0, 32), TEXT_STYLE, Baseline::Top).draw(&mut self.display).unwrap();
+
+    let mut lap: String<24> = String::new();
+    let _ = write!(lap, "LAP: {}s", status.lap_secs);
+    Text::with_baseline(&lap, Point::new(0, 48), TEXT_STYLE, Baseline::Top).draw(&mut self.display).unwrap();
 
     // Record the rendered status only after a successful flush, so a failed flush re-renders next call.
     self.display.flush().await?;
@@ -132,5 +141,21 @@ mod tests {
     let kmh = cm_s_to_kmh(u32::MAX);
     assert_eq!(kmh, ((u32::MAX as u64 * 36 + 500) / 1000) as u32);
     assert_eq!(kmh, 154_618_823);
+  }
+
+  #[test]
+  fn status_default_zeroes_lap_secs() {
+    // The lap timer reads zero at boot/reset, before the first tick has elapsed.
+    assert_eq!(Status::default().lap_secs, 0);
+  }
+
+  #[test]
+  fn lap_secs_participates_in_dirty_check() {
+    // The dirty-check is `self.last == Some(status)`, so a changed lap_secs must make two Statuses unequal —
+    // otherwise the once-per-second lap tick would never re-flush the panel. Conversely an unchanged lap_secs
+    // (everything equal) must compare equal so the render is skipped.
+    let base = Status { speed_cm_s: 1000, link_up: true, gps_fix: true, lap_secs: 5 };
+    assert_eq!(base, base);
+    assert_ne!(base, Status { lap_secs: 6, ..base });
   }
 }

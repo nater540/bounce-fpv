@@ -3,10 +3,17 @@ name = "nrf-adapters"
 version.workspace = true
 edition.workspace = true
 
-# Small glue crate holding the two embedded-hal/-io adapters the frozen driver crates need on nRF: a
-# SimplePwm -> embedded_hal::pwm::SetDutyCycle bridge for the `servo` crate, and a UarteRx ->
-# embedded_io_async::Read bridge for the `gps` crate. No business logic lives here.
+# Small glue crate holding the embedded-hal/-io adapters the frozen driver crates need on nRF: a SimplePwm ->
+# embedded_hal::pwm::SetDutyCycle bridge for the `servo` crate, a UarteRx -> embedded_io_async::Read bridge for
+# the `gps` crate, and the shared SX1276 bring-up (`lora`) that builds the radio Link from the SPIM + pins so the
+# three node binaries no longer copy-paste it. No business logic lives here.
 [dependencies]
 embassy-nrf = { workspace = true }
+embassy-time = { workspace = true }
 embedded-hal = { workspace = true }
+# `async` enables embedded-hal-bus's AsyncSpiDevice impl for ExclusiveDevice — what lets the embassy-nrf async
+# Spim satisfy lora-phy's embedded-hal-async SpiDevice bound (same feature the three binaries used inline).
+embedded-hal-bus = { workspace = true, features = ["async"] }
 embedded-io-async = { workspace = true }
+lora-link = { workspace = true }
+lora-phy = { workspace = true }

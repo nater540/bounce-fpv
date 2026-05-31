@@ -17,9 +17,8 @@
 use applog as _;
 
 use embassy_executor::Spawner;
-use embassy_nrf::interrupt::{InterruptExt, Priority};
 use embassy_nrf::twim::{self, Twim};
-use embassy_nrf::{bind_interrupts, interrupt, peripherals};
+use embassy_nrf::{bind_interrupts, peripherals};
 use embassy_time::{Duration, Ticker, Timer};
 use static_cell::StaticCell;
 
@@ -45,10 +44,6 @@ async fn main(spawner: Spawner) {
   let p = applog::init_embassy_nrf();
   // board_pins! partial-moves only the GPIO pin fields, leaving TWISPI0 / USBD on `p`.
   let pins = board::board_pins!(p);
-
-  // SD COEXISTENCE: Twim::new enables the TWISPI0 interrupt but does NOT set its NVIC priority (it defaults to P0,
-  // which the SoftDevice reserves and would fault on). Lower it to P2 BEFORE building the Twim. CONFIRM ON-TARGET.
-  interrupt::TWISPI0.set_priority(Priority::P2);
 
   applog::init(
     spawner,
@@ -98,6 +93,9 @@ async fn main(spawner: Spawner) {
       speed_cm_s,
       link_up: frame % 2 == 0,
       gps_fix: frame % 3 == 0,
+      // Animate the lap line too so the new field is exercised on the panel: a counter that advances every frame so
+      // the LAP value visibly ticks up alongside the speed/flag demo.
+      lap_secs: frame,
     };
     if let Err(e) = oled.render(status).await {
       applog::log_println!("OLED render error: {:?} — check SDA/SCL + power", e);

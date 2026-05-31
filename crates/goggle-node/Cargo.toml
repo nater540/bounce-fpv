@@ -3,35 +3,26 @@ name = "goggle-node"
 version.workspace = true
 edition.workspace = true
 
-# Goggle node binary. Two Embassy tasks wired by a single latest-value Signal: a PPM reader (GPIO edge-await
-# -> ppm-decoder -> publishes the freshest pan/tilt Control) and a LoRa task (consumes the latest Control,
-# encodes with micropb, transmits, then listens briefly for a Telemetry reply and logs the ground speed over
-# the C6's built-in USB Serial/JTAG). Thin: all real logic lives in the library crates depended on below.
+# Goggle node binary (Phase D: nRF52840). Four Embassy tasks wired by latest-value Signals: a PPM reader (GPIO
+# edge-await -> ppm-decoder -> publishes the freshest pan/tilt Control), a LoRa task (TXes the latest Control,
+# then listens briefly for a Telemetry reply and signals the truck's ground speed), a NEW OLED status task (the
+# panel moved off the truck), and a NEW lap-reset button task. The single I2C device (the SSD1306) uses a direct
+# Twim (no shared_bus). Thin: all real logic lives in the library crates depended on below.
 [dependencies]
 proto = { workspace = true }
 board = { workspace = true }
 ppm-decoder = { workspace = true }
 lora-link = { workspace = true }
+nrf-adapters = { workspace = true }
+display = { workspace = true }
+applog = { workspace = true }
 
-esp-hal = { workspace = true }
-esp-rtos = { workspace = true }
-esp-bootloader-esp-idf = { workspace = true }
-embassy-executor = { workspace = true }
+embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
+embassy-nrf = { workspace = true }
 embassy-time = { workspace = true }
 embassy-sync = { workspace = true }
 embassy-futures = { workspace = true }
-# `async` enables embedded-hal-bus's AsyncSpiDevice impl for ExclusiveDevice, which is what lets the esp-hal
-# async SPI bus + NSS satisfy lora-phy's embedded-hal-async SpiDevice bound.
-embedded-hal-bus = { workspace = true, features = ["async"] }
+cortex-m-rt = { workspace = true }
 static_cell = { workspace = true }
 heapless = { workspace = true }
 micropb = { workspace = true }
-esp-println = { workspace = true }
-log = { workspace = true }
-
-# Board variant is a pass-through feature so a flash can target either layout; default is the XIAO (board's
-# own default). Selecting `board-devkit` here forwards to the board crate's pin-map.
-[features]
-default = ["board-xiao"]
-board-xiao = ["board/board-xiao"]
-board-devkit = ["board/board-devkit"]

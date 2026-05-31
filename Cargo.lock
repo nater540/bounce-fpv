@@ -842,6 +842,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "goggle-node"
+version = "0.1.0"
+dependencies = [
+ "applog",
+ "board",
+ "cortex-m-rt",
+ "display",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-nrf",
+ "embassy-sync",
+ "embassy-time",
+ "heapless 0.9.3",
+ "lora-link",
+ "micropb",
+ "nrf-adapters",
+ "ppm-decoder",
+ "proto",
+ "static_cell",
+]
+
+[[package]]
 name = "gps"
 version = "0.1.0"
 dependencies = [
@@ -1064,8 +1086,8 @@ dependencies = [
  "embassy-futures",
  "embassy-nrf",
  "embassy-time",
- "embedded-hal-bus",
  "lora-link",
+ "nrf-adapters",
 ]
 
 [[package]]
@@ -1161,8 +1183,12 @@ name = "nrf-adapters"
 version = "0.1.0"
 dependencies = [
  "embassy-nrf",
+ "embassy-time",
  "embedded-hal 1.0.0",
+ "embedded-hal-bus",
  "embedded-io-async 0.7.0",
+ "lora-link",
+ "lora-phy",
 ]
 
 [[package]]
@@ -1824,6 +1850,29 @@ dependencies = [
  "imu",
  "mpu6050-dmp",
  "nrf-adapters",
+ "servo",
+ "static_cell",
+]
+
+[[package]]
+name = "truck-node"
+version = "0.1.0"
+dependencies = [
+ "applog",
+ "board",
+ "cortex-m-rt",
+ "embassy-executor",
+ "embassy-nrf",
+ "embassy-sync",
+ "embassy-time",
+ "embedded-hal-async",
+ "gps",
+ "heapless 0.9.3",
+ "imu",
+ "lora-link",
+ "micropb",
+ "nrf-adapters",
+ "proto",
  "servo",
  "static_cell",
 ]

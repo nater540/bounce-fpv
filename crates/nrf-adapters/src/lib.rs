@@ -13,8 +13,14 @@
 //! `UarteRx::read` and shimmed an obsolete embedded-io-async 0.6 error) has been removed — see the GPS
 //! bring-up notes for the `BufferedUarte::new` / `.split()` construction the diagnostic and truck node use.
 
+//! - [`lora::build_lora_link`] builds the shared SX1276 [`lora::Link`] from the SPIM peripheral + the binary's
+//!   `Irqs` binding + the six LoRa pins, returning `Result` so callers log-and-park instead of panicking. It
+//!   replaces the verbatim `Spim::new` + NSS/RESET/DIO0 + `ExclusiveDevice` + `build_sx1276` block (plus the
+//!   `RadioSpi`/`Radio`/`Link` aliases) that goggle-node, truck-node, and lora-ping each copy-pasted.
+
 #![no_std]
 
+pub mod lora;
 pub mod pwm;
 
 pub use pwm::PwmServoChannel;

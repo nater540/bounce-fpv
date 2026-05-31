@@ -1,14 +1,20 @@
-//! Goggle node: decode the Skyzone goggle PPM head-tracking stream and drive the goggle->truck side of the
-//! half-duplex LoRa link.
+//! Goggle node (Phase D: nRF52840): decode the Skyzone goggle PPM head-tracking stream and drive the
+//! goggle->truck side of the half-duplex LoRa link, now with the status OLED + a lap-reset button (both moved
+//! onto the goggle in this phase).
 //!
-//! Two Embassy tasks share a single latest-value `Signal` (lossy — only the freshest head pose matters, stale
-//! samples are dropped, never queued):
-//!   - `ppm_task`  — `Input` on `pins.ppm`, `wait_for_rising_edge().await` + `Instant` deltas fed to a
-//!     `ppm_decoder::PpmDecoder`; on each decoded `Frame` it pulls the pan/tilt channels and signals a
-//!     `proto::Control`.
-//!   - `lora_task` — builds the SX1276 radio from `pins.lora_*`, then on a fixed ~50 Hz cadence takes the
-//!     latest `Control`, encodes it with micropb, transmits, and listens briefly for the truck's `Telemetry`
-//!     reply, logging the ground speed (km/h) over the C6's built-in USB Serial/JTAG (the goggle has no OLED).
+//! Four Embassy tasks, wired by latest-value `Signal`s (lossy — only the freshest value matters, stale samples
+//! are dropped, never queued):
+//!   - `ppm_task`    — `Input` on `pins.ppm`, `wait_for_rising_edge().await` + `Instant` deltas fed to a
+//!     `ppm_decoder::PpmDecoder`; on each decoded `Frame` it pulls the pan/tilt channels and signals `CONTROL`.
+//!   - `lora_task`   — builds the SX1276 radio, then on a fixed ~50 Hz cadence takes the latest `Control`,
+//!     encodes it with micropb, transmits, and listens briefly for the truck's `Telemetry` reply; on a decode
+//!     it signals the ground speed into `SPEED` for the OLED.
+//!   - `oled_task`   — `display::StatusDisplay` on a direct `Twim` (the SSD1306 is the only I2C device here, so
+//!     no shared bus). Renders the truck's speed (from `SPEED`) + link/fix flags + a lap-timer line (whole
+//!     seconds since the last reset).
+//!   - `button_task` — `Input` on `pins.button` (active-low, internal pull-up); on press it signals `LAP_RESET`
+//!     so the OLED re-bases its lap-timer origin (a simple elapsed-since-reset stopwatch for now; richer lap
+//!     detection is a future TODO).
 //!
 //! Half-duplex turnaround (scaffold scheme, tunable on hardware): the goggle is the link master. It TXes a
 //! Control, then immediately listens for one Telemetry reply with a short bounded timeout before the next
@@ -18,36 +24,32 @@
 #![no_std]
 #![no_main]
 
+// Pull in the shared #[panic_handler] (defined once in applog). applog ALSO provides defmt-rtt's #[global_logger]
+// (it does `use defmt_rtt as _;`), which is what lets lora-phy's unconditional defmt dependency link here without
+// any per-binary defmt setup.
+use applog as _;
+
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
+use embassy_nrf::gpio::{Input, Pull};
+use embassy_nrf::spim;
+use embassy_nrf::twim::{self, Twim};
+use embassy_nrf::{bind_interrupts, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
-use embedded_hal_bus::spi::ExclusiveDevice;
-use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::interrupt::software::SoftwareInterruptControl;
-use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::spi::Mode;
-use esp_hal::time::Rate;
-use esp_hal::timer::timg::TimerGroup;
-use esp_hal::Async;
-use esp_println::println;
-use lora_link::{LoraLink, Sx1276Radio};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use micropb::{MessageDecode, MessageEncode, PbEncoder};
 use ppm_decoder::{Config as PpmConfig, PpmDecoder};
 use proto::{Control, Telemetry};
+use static_cell::StaticCell;
 
-// Manual panic handler: log over USB Serial/JTAG then park. esp-rtos owns the runtime, so we keep this minimal
-// rather than pulling in esp-backtrace (matches ppm-diag).
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo) -> ! {
-  println!("PANIC: {}", info);
-  loop {}
-}
-
-// App descriptor required by the esp-idf second-stage bootloader.
-esp_bootloader_esp_idf::esp_app_desc!();
+// Bind the SERIAL interrupts this node uses: SPIM3 (LoRa SPI bus) and TWISPI0 (OLED I2C). USBD is bound by applog
+// — do NOT bind it here. GPIOTE (PPM + DIO0 + button edge waits) is bound by embassy-nrf's init at the SD-safe P2
+// priority via init_embassy_nrf.
+bind_interrupts!(struct Irqs {
+  SPIM3 => spim::InterruptHandler<peripherals::SPI3>;
+  TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>;
+});
 
 // Skyzone head-tracker channel indices, 0-based (menu "channel 5/6" are indices 4/5). CONFIRMED on hardware via
 // `ppm-diag` (2026-05-30): ch5 = pan = index 4, ch6 = tilt = index 5; these are the documented SKY01/SKY02
@@ -69,69 +71,92 @@ const REPLY_TIMEOUT: Duration = Duration::from_millis(12);
 // enabled in the radio build below). TODO: tune on hardware / per regional limits.
 const TX_POWER_DBM: i32 = 17;
 
+// PA output routing. The bare RFM95W bonds ONLY its PA_BOOST pin to the antenna, so tx_boost MUST be true or the
+// radiated power is near-zero and the link silently fails to come up (see lora-ping for the full rationale).
+const TX_BOOST: bool = true;
+
+// OLED refresh cadence. The panel only shows a human-readable glance, so a few Hz is plenty.
+const OLED_PERIOD: Duration = Duration::from_millis(250);
+
+// Link liveness window: if no Telemetry reply has been decoded within this span, the OLED shows LINK:N. A couple
+// of TX cycles' worth of slack so a single dropped reply does not flap the flag. TODO: tune on hardware.
+const LINK_TIMEOUT: Duration = Duration::from_millis(500);
+
 // Latest pan/tilt command, published by the PPM reader and consumed by the LoRa task. CriticalSectionRawMutex
-// because the Signal is a `static` shared across tasks (and potentially executors).
+// because the Signal is a `static` shared across tasks.
 static CONTROL: Signal<CriticalSectionRawMutex, Control> = Signal::new();
+// Latest truck telemetry decoded by the LoRa task, consumed by the OLED task to render speed + fix flags.
+static SPEED: Signal<CriticalSectionRawMutex, Telemetry> = Signal::new();
+// Lap-reset edge from the button, consumed by the OLED task to reset its placeholder lap timer. The unit payload
+// is just an event marker — the OLED re-bases its elapsed-time origin when it fires.
+static LAP_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-// Concrete radio type for this board: the SX1276 over an ExclusiveDevice (SPI2 async bus + NSS Output + a
-// blocking/async `Delay`), with the RESET Output and DIO0 Input as the lora-phy interface-variant pins. Named
-// so the spawned `lora_task` has a non-generic signature (an Embassy task cannot be generic).
-type RadioSpi = ExclusiveDevice<Spi<'static, Async>, Output<'static>, Delay>;
-type Radio = Sx1276Radio<RadioSpi, Output<'static>, Input<'static>>;
-type Link = LoraLink<Radio, Delay>;
+// The radio type lives in `nrf_adapters::lora` now (shared by both nodes + lora-ping so it can never drift); the
+// spawned LoRa task takes `nrf_adapters::lora::Link` directly for its non-generic signature.
+// The OLED's direct (non-shared) I2C device: embassy-nrf's Twim implements embedded-hal-async I2c, exactly the
+// bound display::StatusDisplay::new requires.
+type OledI2c = Twim<'static>;
 
-#[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
-  let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-  let peripherals = esp_hal::init(config);
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+  // embassy-nrf init at SoftDevice-safe interrupt priorities (GPIOTE + time-driver at P2; the SD reserves P0/P1/P4).
+  let p = applog::init_embassy_nrf();
+  // board_pins! partial-moves only the GPIO pin fields out of `p`, leaving the controller singletons (SPI3,
+  // TWISPI0, USBD, ...) on `p` for the rest of main.
+  let pins = board::board_pins!(p);
 
-  // `board_pins!` partial-moves only the GPIO pin fields out of `peripherals` into BoardPins, so the binding
-  // retains the controller singletons (SPI2/TIMG0/SW_INTERRUPT/...) and we use them directly by field access.
-  let pins = board::board_pins!(peripherals);
+  // SD COEXISTENCE: init_embassy_nrf centrally lowers all SERIAL/SPIM/TWIM/UARTE IRQs to P2 (the SD-safe band with
+  // GPIOTE + the time driver), so the per-binary set_priority calls are gone — the peripheral constructors below
+  // inherit P2. CONFIRM ON-TARGET that SPIM3 + TWISPI0 + GPIOTE coexist with the SD enabled.
 
-  // esp-rtos drives Embassy off a TIMG timer + a software interrupt; this runs before any timing primitive is
-  // awaited or any task is spawned.
-  let timg0 = TimerGroup::new(peripherals.TIMG0);
-  let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-  esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+  applog::init(
+    spawner,
+    p.USBD,
+    applog::UsbIdentity::new(0x1209, 0x0001, "fabulous-fpv", "goggle", "d"),
+  );
 
-  println!();
-  println!("=== goggle-node: PPM -> LoRa TX, Telemetry RX ===");
+  applog::log_println!("");
+  applog::log_println!("=== goggle-node: PPM -> LoRa TX, Telemetry RX -> OLED (nRF52840) ===");
 
-  // PPM line idles low and pulses high (matches ppm-diag): pull-down keeps it defined when unplugged.
-  let ppm = Input::new(pins.ppm, InputConfig::default().with_pull(Pull::Down));
+  // PPM line idles low and pulses high (matches ppm-diag): pull-down keeps it defined when unplugged, and the
+  // rising edge marks each channel position.
+  let ppm = Input::new(pins.ppm, Pull::Down);
 
-  // Build the SX1276 SPI bus on SPI2 at 1 MHz, mode 0 (the SX1276 default). The bus is created blocking then
-  // converted to async; NSS/RESET are push-pull Outputs (idle high), DIO0 is the IRQ Input the RX/TX futures
-  // await. ExclusiveDevice owns the bus + NSS and toggles CS around each transfer.
-  let spi_bus = Spi::new(
-    peripherals.SPI2,
-    SpiConfig::default().with_frequency(Rate::from_mhz(1)).with_mode(Mode::_0),
+  // Lap-reset button: active-low to GND with an internal pull-up, so the line idles high and a press drives it low
+  // (a falling edge). GPIOTE backs the edge wait.
+  let button = Input::new(pins.button, Pull::Up);
+
+  // Build the SX1276/RFM95W link via the shared nrf-adapters helper (Spim on SPI3 + NSS/RESET Outputs + DIO0 Input
+  // + ExclusiveDevice, all centralized). Pins go in sck/mosi/miso then nss/reset/dio0 order; tx_boost drives the
+  // bare module's PA_BOOST output. On an init error (e.g. a wiring fault) the deployed node must NOT panic into
+  // DFU — log and park forever instead, matching the lora-ping diagnostic.
+  let link = match nrf_adapters::lora::build_lora_link(
+    p.SPI3, Irqs, pins.lora_sck, pins.lora_mosi, pins.lora_miso, pins.lora_nss, pins.lora_reset, pins.lora_dio0,
+    TX_BOOST,
   )
-  .expect("SPI2 config")
-  .with_sck(pins.lora_sck)
-  .with_mosi(pins.lora_mosi)
-  .with_miso(pins.lora_miso)
-  .into_async();
+  .await
+  {
+    Ok(link) => link,
+    Err(e) => {
+      applog::log_println!("radio init FAILED ({:?})", e);
+      loop {
+        Timer::after_secs(60).await;
+      }
+    }
+  };
 
-  let nss = Output::new(pins.lora_nss, Level::High, OutputConfig::default());
-  let reset = Output::new(pins.lora_reset, Level::High, OutputConfig::default());
-  let dio0 = Input::new(pins.lora_dio0, InputConfig::default().with_pull(Pull::None));
-  let spi_dev = ExclusiveDevice::new(spi_bus, nss, Delay).expect("ExclusiveDevice");
-
-  // Bare RFM95W: enable tx_boost for the PA_BOOST output pin. build_sx1276 fixes SF7/BW500/CR4-5 @ 915 MHz.
-  let link: Link = lora_link::build_sx1276(spi_dev, reset, dio0, Delay, true)
-    .await
-    .expect("SX1276 radio init");
+  // OLED I2C on TWISPI0. The SSD1306 is the only I2C device here, so it gets a direct Twim (no shared bus). The
+  // TWIM tx_ram_buffer must be 'static (it outlives the 'static peripheral); a StaticCell gives it that, and 16
+  // bytes is ample for the small command bytes the driver sends (ssd1306 flushes its framebuffer from its own RAM).
+  static TWIM_TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
+  let tx_buf = TWIM_TX_BUF.init([0; 16]);
+  let oled_i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, twim::Config::default(), tx_buf);
 
   // The task macro returns a Result<SpawnToken, SpawnError> (the pool-full case); unwrap the token then spawn.
   spawner.spawn(ppm_task(ppm).expect("ppm_task token"));
   spawner.spawn(lora_task(link).expect("lora_task token"));
-
-  // Nothing else for the entry task to do; the executor keeps the spawned tasks running.
-  loop {
-    Timer::after(Duration::from_secs(3600)).await;
-  }
+  spawner.spawn(oled_task(oled_i2c).expect("oled_task token"));
+  spawner.spawn(button_task(button).expect("button_task token"));
 }
 
 /// PPM reader task. Times rising edges with `Instant`, feeds inter-edge deltas to the decoder, and on each
@@ -139,6 +164,8 @@ async fn main(spawner: Spawner) -> ! {
 /// by design — if the LoRa task is mid-transmit, intervening frames are simply overwritten.
 #[embassy_executor::task]
 async fn ppm_task(mut ppm: Input<'static>) {
+  // Default Config suppresses corrupt frames (unlike ppm-diag, which surfaces them) — the production node only
+  // wants clean frames, so a noisy/partial frame never reaches the servos through the link.
   let mut decoder = PpmDecoder::new(PpmConfig::default());
   let mut last_edge: Option<Instant> = None;
 
@@ -162,10 +189,11 @@ async fn ppm_task(mut ppm: Input<'static>) {
 }
 
 /// LoRa task (link master). On each ~50 Hz tick: take the freshest `Control`, encode it, transmit, then listen
-/// for one `Telemetry` reply within `REPLY_TIMEOUT`; decode and log the ground speed (km/h). A missed reply is
-/// logged and the loop moves on so the head-tracking TX rate is never held hostage by the truck's reply.
+/// for one `Telemetry` reply within `REPLY_TIMEOUT`; on a decode it signals the telemetry into `SPEED` for the
+/// OLED. A missed reply is logged and the loop moves on so the head-tracking TX rate is never held hostage by
+/// the truck's reply.
 #[embassy_executor::task]
-async fn lora_task(mut link: Link) {
+async fn lora_task(mut link: nrf_adapters::lora::Link) {
   let mut ticker = Ticker::every(TX_PERIOD);
   // Until the first PPM frame, send center so the truck has a defined pose.
   let mut latest = Control { pan_us: CENTER_US, tilt_us: CENTER_US };
@@ -184,12 +212,12 @@ async fn lora_task(mut link: Link) {
     // container-heapless-0-9 implements PbWrite for exactly this heapless 0.9 Vec.
     let mut enc = PbEncoder::new(heapless::Vec::<u8, 12>::new());
     if latest.encode(&mut enc).is_err() {
-      println!("control encode failed");
+      applog::log_println!("control encode failed");
       continue;
     }
     let payload = enc.into_writer();
     if let Err(e) = link.send(&payload, TX_POWER_DBM).await {
-      println!("LoRa TX error: {:?}", e);
+      applog::log_println!("LoRa TX error: {:?}", e);
       continue;
     }
 
@@ -198,16 +226,85 @@ async fn lora_task(mut link: Link) {
       Either::First(Ok(len)) => {
         let mut telem = Telemetry::default();
         if telem.decode_from_bytes(&rx_buf[..len]).is_ok() {
-          // km/h = cm_s * 36 / 1000, integer rounded — the goggle's "display" is this serial line. speed_cm_s is
-          // a freshly-decoded (externally controllable) uint32, so widen to u64 first: the product can never wrap.
+          // km/h = cm_s * 36 / 1000, integer rounded — logged here for the serial console; the freshest telemetry
+          // is also handed to the OLED. speed_cm_s is an externally-controllable uint32, so widen to u64 first so
+          // the product can never wrap (review fix #3).
           let kmh = ((telem.speed_cm_s as u64 * 36 + 500) / 1000) as u32;
-          println!("telemetry: {} km/h | sats {} | fix {}", kmh, telem.sats, telem.fix_quality);
+          applog::log_println!("telemetry: {} km/h | sats {} | fix {}", kmh, telem.sats, telem.fix_quality);
+          SPEED.signal(telem);
         } else {
-          println!("telemetry decode failed ({} bytes)", len);
+          applog::log_println!("telemetry decode failed ({} bytes)", len);
         }
       }
-      Either::First(Err(e)) => println!("LoRa RX error: {:?}", e),
+      Either::First(Err(e)) => applog::log_println!("LoRa RX error: {:?}", e),
       Either::Second(()) => { /* no reply this cycle — expected occasionally, just move on. */ }
+    }
+  }
+}
+
+/// OLED status task. Renders the truck's ground speed (km/h, from `SPEED`) + link/fix flags + a lap-timer line
+/// (whole seconds since the last reset) on a direct (non-shared) I2C bus. "Link up" is a real liveness check: a
+/// Telemetry reply decoded within `LINK_TIMEOUT`. The lap timer is an elapsed-since-reset stopwatch — richer lap
+/// detection is a future TODO; the button task's `LAP_RESET` re-bases the elapsed-time origin.
+#[embassy_executor::task]
+async fn oled_task(i2c: OledI2c) {
+  let mut oled = match display::StatusDisplay::new(i2c).await {
+    Ok(d) => d,
+    Err(e) => {
+      // A missing/miswired panel must not brick the goggle; log and let the task exit cleanly.
+      applog::log_println!("OLED init failed: {:?}", e);
+      return;
+    }
+  };
+
+  let mut ticker = Ticker::every(OLED_PERIOD);
+  let mut last = Telemetry::default();
+  // Timestamp of the last decoded Telemetry reply. Initialized far enough in the past that the link reads down
+  // until a real reply arrives (Instant is monotonic, so duration_since never underflows). saturating_sub guards
+  // the boot case where now < LINK_TIMEOUT.
+  let mut last_rx = Instant::now().saturating_sub(LINK_TIMEOUT);
+  // Lap stopwatch origin: re-based to now on each LAP_RESET (or boot). The OLED shows elapsed-since-reset in
+  // whole seconds; richer lap detection is a future TODO.
+  let mut lap_origin = Instant::now();
+
+  loop {
+    ticker.next().await;
+    if let Some(telem) = SPEED.try_take() {
+      last = telem;
+      last_rx = Instant::now();
+    }
+    if LAP_RESET.try_take().is_some() {
+      lap_origin = Instant::now();
+    }
+
+    // Real liveness, not a one-way latch: the link is up only while a reply has been seen within LINK_TIMEOUT, so
+    // the OLED falls back to LINK:N when the truck goes away instead of showing LINK:Y forever.
+    let link_up = Instant::now().duration_since(last_rx) < LINK_TIMEOUT;
+    let gps_fix = last.fix_quality != 0;
+    // Whole seconds since the last LAP_RESET (or boot). The display dirty-check skips the flush until this ticks
+    // over, so the panel only re-renders the lap line ~1 Hz while everything else is steady.
+    let lap_secs = Instant::now().duration_since(lap_origin).as_secs() as u32;
+    let status = display::Status { speed_cm_s: last.speed_cm_s, link_up, gps_fix, lap_secs };
+    if let Err(e) = oled.render(status).await {
+      applog::log_println!("OLED render error: {:?}", e);
+    }
+  }
+}
+
+/// Lap-reset button task. The button is active-low with an internal pull-up, so a press is a falling edge; on each
+/// press it signals `LAP_RESET` for the OLED to re-base its placeholder lap timer. Full lap logic is a future TODO.
+#[embassy_executor::task]
+async fn button_task(mut button: Input<'static>) {
+  loop {
+    // Wait for the press edge (active-low -> falling), then sleep the debounce window and RE-CHECK the line is
+    // still low. A real press holds the line low past the window; a bounce/glitch has released by then and fires
+    // no reset. Only on a confirmed press do we signal LAP_RESET once, then wait for the rising edge (release)
+    // before re-arming — so one physical press = exactly one reset. TODO: tune the debounce window on hardware.
+    button.wait_for_falling_edge().await;
+    Timer::after(Duration::from_millis(50)).await;
+    if button.is_low() {
+      LAP_RESET.signal(());
+      button.wait_for_rising_edge().await;
     }
   }
 }

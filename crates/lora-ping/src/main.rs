@@ -2,8 +2,8 @@
 //!
 //! This validates the radio wiring (SPI SCK/MOSI/MISO + NSS/RESET/DIO0) and measures the ping->pong round-trip
 //! latency at the link's chosen modulation (SF7 / BW 500 kHz / CR 4/5 @ 915 MHz) BEFORE the full goggle<->truck path
-//! is integrated. It builds the same embassy-nrf async SPIM + `ExclusiveDevice` + `build_sx1276` radio the node
-//! binaries will use, so a clean run here de-risks every downstream LoRa assumption.
+//! is integrated. It brings up the radio through the same shared `nrf_adapters::lora::build_lora_link` helper the
+//! node binaries use, so a clean run here de-risks every downstream LoRa assumption.
 //!
 //! One binary, two roles selected by a Cargo feature (mirrors ppm-diag's `inverted-ppm` cfg style):
 //!   - feature OFF (default) -> PINGER: send a small seq-numbered packet, await the echo with a bounded timeout,
@@ -38,16 +38,11 @@ use applog as _;
 use embassy_executor::Spawner;
 #[cfg(not(feature = "ponger"))]
 use embassy_futures::select::{select, Either};
-use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
-use embassy_nrf::spim::{self, Spim};
-use embassy_nrf::{bind_interrupts, interrupt, peripherals};
-use embassy_nrf::interrupt::{InterruptExt, Priority};
-use embassy_time::Delay;
+use embassy_nrf::spim;
+use embassy_nrf::{bind_interrupts, peripherals};
 #[cfg(not(feature = "ponger"))]
 use embassy_time::Instant;
 use embassy_time::{Duration, Timer};
-use embedded_hal_bus::spi::ExclusiveDevice;
-use lora_link::{LoraLink, Sx1276Radio};
 
 // Bind ONLY the SPIM3 interrupt this binary uses (the LoRa SPI bus on SPI3). USBD is bound by applog — do NOT bind it
 // here. GPIOTE (DIO0 edge waits) is bound by embassy-nrf's init at the SD-safe P2 priority via init_embassy_nrf.
@@ -90,13 +85,6 @@ const ECHO_TIMEOUT: Duration = Duration::from_millis(150);
 #[cfg(not(feature = "ponger"))]
 const STATS_EVERY: u32 = 10;
 
-// Concrete radio type for this board: the SX1276 over an ExclusiveDevice (SPIM3 async bus + NSS Output + a
-// blocking/async `Delay`), with the RESET Output and DIO0 Input as the lora-phy interface-variant pins. Matches the
-// node binaries' aliases; this prototype runs everything in `main`, but the alias keeps the types readable.
-type RadioSpi = ExclusiveDevice<Spim<'static>, Output<'static>, Delay>;
-type Radio = Sx1276Radio<RadioSpi, Output<'static>, Input<'static>>;
-type Link = LoraLink<Radio, Delay>;
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
   // embassy-nrf init at SoftDevice-safe interrupt priorities (GPIOTE + time-driver at P2; the SD reserves P0/P1/P4).
@@ -104,11 +92,6 @@ async fn main(spawner: Spawner) {
   // board_pins! partial-moves only the GPIO pin fields out of `p`, leaving the controller singletons (SPI3, USBD, ...)
   // on `p` for the rest of main.
   let pins = board::board_pins!(p);
-
-  // SD COEXISTENCE: Spim::new enables the SPIM3 interrupt but does NOT set its NVIC priority, which defaults to P0 —
-  // a priority the SoftDevice reserves, so a SPIM IRQ there would fault the SD. Lower it to P2 (same band as GPIOTE /
-  // the time driver) BEFORE building the Spim. CONFIRM ON-TARGET that the radio IRQ behaves with the SD enabled.
-  interrupt::SPIM3.set_priority(Priority::P2);
 
   applog::init(
     spawner,
@@ -137,21 +120,17 @@ async fn main(spawner: Spawner) {
     board::LORA_RESET_PORT, board::LORA_RESET_PIN, board::LORA_DIO0_PORT, board::LORA_DIO0_PIN
   );
 
-  // Build the SX1276 SPI bus on SPI3. spim::Config defaults to 1 MHz, mode 0 (the SX1276 default), which is exactly
-  // what the radio wants. NSS/RESET are push-pull Outputs (idle high); DIO0 is the IRQ Input the RX/TX futures await.
-  // ExclusiveDevice owns the bus + NSS and toggles CS around each transfer.
-  let spi_bus = Spim::new(p.SPI3, Irqs, pins.lora_sck, pins.lora_miso, pins.lora_mosi, spim::Config::default());
-
-  let nss = Output::new(pins.lora_nss, Level::High, OutputDrive::Standard);
-  let reset = Output::new(pins.lora_reset, Level::High, OutputDrive::Standard);
-  let dio0 = Input::new(pins.lora_dio0, Pull::None);
-  let spi_dev = ExclusiveDevice::new(spi_bus, nss, Delay).expect("ExclusiveDevice");
-
-  // Bring up the radio. build_sx1276 fixes SF7/BW500/CR4-5 @ 915 MHz (lora-link's defaults). On failure DO NOT panic
-  // silently — log the error and park, because an error here almost always means a wiring fault (NSS/RESET/DIO0 or a
-  // SPI line), which is exactly what this prototype exists to catch.
+  // Bring up the radio via the shared nrf-adapters helper (the SPIM + NSS/RESET/DIO0 glue the nodes also use, fixing
+  // SF7/BW500/CR4-5 @ 915 MHz). It returns Result, so on failure DO NOT panic silently — log the error and park,
+  // because an error here almost always means a wiring fault (NSS/RESET/DIO0 or a SPI line), which is exactly what
+  // this prototype exists to catch.
   applog::log_println!("radio init: building SX1276 ...");
-  let link: Link = match lora_link::build_sx1276(spi_dev, reset, dio0, Delay, TX_BOOST).await {
+  let link: nrf_adapters::lora::Link = match nrf_adapters::lora::build_lora_link(
+    p.SPI3, Irqs, pins.lora_sck, pins.lora_mosi, pins.lora_miso, pins.lora_nss, pins.lora_reset, pins.lora_dio0,
+    TX_BOOST,
+  )
+  .await
+  {
     Ok(link) => {
       applog::log_println!("radio init: OK");
       link
@@ -176,7 +155,7 @@ async fn main(spawner: Spawner) {
 /// prints it with the echo's RSSI/SNR; it also tracks running min/avg/max RTT and a lost count, printed every
 /// STATS_EVERY pings. A timeout prints an explicit wiring/power hint rather than deadlocking. Never returns.
 #[cfg(not(feature = "ponger"))]
-async fn pinger(mut link: Link) -> ! {
+async fn pinger(mut link: nrf_adapters::lora::Link) -> ! {
   applog::log_println!(
     "pinger: sending one ping every {} ms, echo timeout {} ms",
     PING_PERIOD.as_millis(),
@@ -276,7 +255,7 @@ fn valid_echo(buf: &[u8], expected_seq: u32) -> bool {
 /// magic bumped to PONG_MAGIC so the direction is visible on the wire) and prints the seq + RSSI/SNR it heard. This
 /// exercises the ponger's own RX->TX turnaround and the full SPI/NSS/RESET/DIO0 path on its board. Never returns.
 #[cfg(feature = "ponger")]
-async fn ponger(mut link: Link) -> ! {
+async fn ponger(mut link: nrf_adapters::lora::Link) -> ! {
   applog::log_println!("ponger: listening, will echo every packet back with magic 0x{:02X}", PONG_MAGIC);
   applog::log_println!("");
 

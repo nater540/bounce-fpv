@@ -17,8 +17,8 @@ members = [
   # deps are gone; re-added when ported to embassy-nrf in Phase C/D (their source stays on disk):
   "crates/lora-ping",    # standalone LoRa link bring-up prototype (ported to embassy-nrf in Phase C)
   "crates/truck-diag",   # truck peripheral bring-up diagnostics: servo / imu / oled / gps bins (Phase C)
-  # "crates/goggle-node",  # binary: PPM reader -> LoRa TX
-  # "crates/truck-node",   # binary: LoRa RX -> servos + IMU + OLED
+  "crates/goggle-node",  # binary: PPM reader -> LoRa TX + Telemetry RX -> OLED + lap-reset button (Phase D)
+  "crates/truck-node",   # binary: LoRa RX -> servos + IMU + GPS, Telemetry reply (headless; Phase D)
 ]
 
 [workspace.package]

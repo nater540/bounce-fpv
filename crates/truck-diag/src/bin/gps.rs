@@ -25,9 +25,8 @@ use applog as _;
 
 use embassy_executor::Spawner;
 use embassy_nrf::buffered_uarte::{self, BufferedUarteRx};
-use embassy_nrf::interrupt::{InterruptExt, Priority};
 use embassy_nrf::uarte::{self, Baudrate};
-use embassy_nrf::{bind_interrupts, interrupt, peripherals};
+use embassy_nrf::{bind_interrupts, peripherals};
 use static_cell::StaticCell;
 
 // Bind ONLY the UARTE1 interrupt this binary uses (the GPS UART on UARTE1). It MUST be the buffered-UARTE handler,
@@ -44,10 +43,6 @@ async fn main(spawner: Spawner) {
   // board_pins! partial-moves only the GPIO pin fields, leaving the controller singletons (UARTE1, TIMER1, the PPI
   // channels/group BufferedUarteRx needs, USBD) on `p`.
   let pins = board::board_pins!(p);
-
-  // SD COEXISTENCE: BufferedUarteRx::new enables the UARTE1 interrupt but does NOT set its NVIC priority (it defaults
-  // to P0, which the SoftDevice reserves and would fault on). Lower it to P2 BEFORE constructing. CONFIRM ON-TARGET.
-  interrupt::UARTE1.set_priority(Priority::P2);
 
   applog::init(
     spawner,
@@ -78,10 +73,11 @@ async fn main(spawner: Spawner) {
   let mut config = uarte::Config::default();
   config.baudrate = Baudrate::BAUD9600;
 
-  // 256-byte (EVEN) RX ring: comfortably larger than a single ~82-byte NMEA sentence, so a burst of sentences between
-  // reads is absorbed without overrun even while the parser is busy.
-  static RX_RING: StaticCell<[u8; 256]> = StaticCell::new();
-  let rx_ring = RX_RING.init([0u8; 256]);
+  // 512-byte (EVEN) RX ring: comfortably larger than a single ~82-byte NMEA sentence, sized for scheduler-stall slack
+  // so a burst of sentences is absorbed while the parser/USB-CDC path is busy. Overrun is NOT recoverable here — a
+  // UARTE overrun with the ring full PANICS inside embassy-nrf's ISR — so the buffer must be generous, not retried.
+  static RX_RING: StaticCell<[u8; 512]> = StaticCell::new();
+  let rx_ring = RX_RING.init([0u8; 512]);
 
   let rx = BufferedUarteRx::new(
     p.UARTE1, p.TIMER1, p.PPI_CH0, p.PPI_CH1, p.PPI_GROUP0, Irqs, pins.gps_rx, config, rx_ring,
@@ -108,7 +104,9 @@ async fn parsed_loop(rx: BufferedUarteRx<'static>) -> ! {
         let quality = fix.fix.map(|f| f.raw as u32).unwrap_or(0);
         applog::log_println!("speed {} cm/s ({} km/h) | sats {} | fix quality {}", fix.speed_cm_s, kmh, sats, quality);
       }
-      // A UART read error (framing/overrun) is transient; pace retries so a wiring fault does not spin the console hot.
+      // NOT a retryable/"transient" error: a UARTE overrun (RX overrun + ring full) PANICS inside embassy-nrf's ISR,
+      // never surfacing here, and BufferedUarteRx's `Error` enum is empty, so this arm is effectively unreachable. If
+      // it ever fires, pace it so a wiring fault does not spin the console hot, then keep polling.
       Err(_) => {
         applog::log_println!("UART read error — check RX wiring + baud (try `--features gps-raw` to see raw bytes)");
         embassy_time::Timer::after(embassy_time::Duration::from_millis(200)).await;

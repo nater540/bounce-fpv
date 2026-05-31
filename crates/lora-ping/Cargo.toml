@@ -13,15 +13,15 @@ edition.workspace = true
 board = { workspace = true }
 applog = { workspace = true }
 lora-link = { workspace = true }
+# Shared SX1276/RFM95W bring-up (SPIM + NSS/RESET/DIO0 glue) used by the nodes too; returns Result so this prototype
+# can log-and-park on a wiring fault instead of panicking. It owns the ExclusiveDevice + embedded-hal-bus `async` dep.
+nrf-adapters = { workspace = true }
 
 embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
 embassy-nrf = { workspace = true }
 embassy-time = { workspace = true }
 embassy-futures = { workspace = true }
 cortex-m-rt = { workspace = true }
-# `async` enables embedded-hal-bus's AsyncSpiDevice impl for ExclusiveDevice, which is what lets the embassy-nrf async
-# SPIM bus + NSS satisfy lora-phy's embedded-hal-async SpiDevice bound (same as the node manifests will).
-embedded-hal-bus = { workspace = true, features = ["async"] }
 
 [features]
 # Role select: default (feature OFF) = PINGER; `ponger` ON = PONGER.

@@ -37,6 +37,7 @@ use core::fmt::Write as _;
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use embassy_executor::Spawner;
+use embassy_nrf::interrupt::InterruptExt as _;
 use embassy_nrf::{interrupt, peripherals, Peri, Peripherals};
 use log::LevelFilter;
 use nrf_softdevice::raw;
@@ -73,13 +74,31 @@ impl UsbIdentity {
 
 // Initialize embassy-nrf at SoftDevice-safe interrupt priorities and return the peripheral set. The SoftDevice
 // reserves interrupt priorities P0/P1/P4, so embassy's GPIOTE and time-driver interrupts must sit at P2 (P3
-// also works) to stay out of the SD's way. Call this FIRST in `main`, before `init`, then pass `p.USBD` into
-// `init` and use the remaining peripherals (LED, I2C, SPI, ...) for the application.
+// also works) to stay out of the SD's way. This ALSO lowers the whole serial-peripheral IRQ family (SPIM/TWIM/
+// UARTE/SAADC) to P2 here so no binary has to remember to do it — a forgotten lowering is a runtime-only SD
+// HardFault. Call this FIRST in `main`, before `init`, then pass `p.USBD` into `init` and use the remaining
+// peripherals (LED, I2C, SPI, ...) for the application. Binaries must NOT call set_priority themselves.
 pub fn init_embassy_nrf() -> Peripherals {
   let mut config = embassy_nrf::config::Config::default();
   config.gpiote_interrupt_priority = interrupt::Priority::P2;
   config.time_interrupt_priority = interrupt::Priority::P2;
-  embassy_nrf::init(config)
+  let p = embassy_nrf::init(config);
+  // Centralize SD-safe NVIC priorities so binaries must NOT call set_priority themselves. Every app peripheral
+  // IRQ defaults to NVIC P0, which collides with the SoftDevice's reserved P0/P1/P4 — leaving any enabled
+  // peripheral IRQ in that range is a runtime-only SD HardFault (the USBD-at-P0 bug was exactly this). Setting
+  // the priority on an interrupt that is never enabled is harmless, so we preemptively lower the WHOLE family
+  // of serial-peripheral IRQs an app might use here, right after init, regardless of which a given binary wires
+  // up. GPIOTE + the time-driver are already P2 via the config above; USBD is lowered in usb.rs. P2 matches
+  // those. Note the canonical embassy-nrf names alias the PAC IRQs: TWISPI0 covers SPIM0/TWIM0/SPIS0/TWIS0,
+  // TWISPI1 covers SPIM1/TWIM1/..., and SPI2 covers SPIM2/SPIS2 — one set_priority per shared IRQ suffices.
+  interrupt::TWISPI0.set_priority(interrupt::Priority::P2); // SPIM0 / TWIM0 / SPIS0 / TWIS0 (shared IRQ).
+  interrupt::TWISPI1.set_priority(interrupt::Priority::P2); // SPIM1 / TWIM1 / SPIS1 / TWIS1 (shared IRQ).
+  interrupt::SPI2.set_priority(interrupt::Priority::P2);    // SPIM2 / SPIS2 (shared IRQ).
+  interrupt::SPIM3.set_priority(interrupt::Priority::P2);   // SPIM3 (its own IRQ; the diag/node bins use it).
+  interrupt::UARTE0.set_priority(interrupt::Priority::P2);  // UARTE0.
+  interrupt::UARTE1.set_priority(interrupt::Priority::P2);  // UARTE1 (the gps diag + truck node use it).
+  interrupt::SAADC.set_priority(interrupt::Priority::P2);   // SAADC (analog reads, if any binary samples).
+  p
 }
 
 // Bring up the full SoftDevice + USB-CDC logging stack and install the `log` backend at the given level. This

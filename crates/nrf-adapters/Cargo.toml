@@ -11,6 +11,9 @@ edition.workspace = true
 embassy-nrf = { workspace = true }
 embassy-time = { workspace = true }
 embedded-hal = { workspace = true }
+# Names the async `SpiDevice` trait so the LoRa bring-up can read the SX127x version register straight off the
+# ExclusiveDevice (a chip-presence probe) before handing the bus to lora-phy.
+embedded-hal-async = { workspace = true }
 # `async` enables embedded-hal-bus's AsyncSpiDevice impl for ExclusiveDevice — what lets the embassy-nrf async
 # Spim satisfy lora-phy's embedded-hal-async SpiDevice bound (same feature the three binaries used inline).
 embedded-hal-bus = { workspace = true, features = ["async"] }

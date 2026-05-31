@@ -13,6 +13,15 @@
 //! Flash ONE board with the default build and the OTHER with `--features ponger`; power both, watch the pinger's
 //! console for stable low RTT and matching seq numbers.
 //!
+//! ## Status OLED (primary readout — both roles)
+//!
+//! USB-CDC serial is fiddly on these boards, so both roles ALSO mirror their status to an SSD1306 panel on the shared
+//! I2C bus (`TWISPI0`, 0x3C) via the `display` crate — no tether needed to watch the link. The pinger panel shows the
+//! last RTT (or `LOST`), RSSI/SNR, the seq, and the lost/avg stats; the ponger panel shows the last heard seq, its
+//! RSSI/SNR, and a running receive count. The OLED is on a different SERIAL instance than the LoRa SPI (`SPI3`), so the
+//! two never collide. It is deliberately NON-FATAL: if the panel is absent or miswired the bin logs it and keeps
+//! running the link test serial-only, since exercising the radio is the whole point here.
+//!
 //! Payload format (5 bytes, deliberately independent of the `proto` crate — this is a link test, not a protocol
 //! test): bytes 0..4 = the u32 sequence counter, little-endian; byte 4 = a 1-byte magic tag (PING_MAGIC on the
 //! ping, PONG_MAGIC on the echo). The pinger validates both the echoed seq and the pong magic before counting an
@@ -35,19 +44,25 @@
 // per-binary defmt setup. Replaces the old esp manual panic handler + esp_bootloader_esp_idf::esp_app_desc!() macro.
 use applog as _;
 
+use core::fmt::Write as _;
 use embassy_executor::Spawner;
 #[cfg(not(feature = "ponger"))]
 use embassy_futures::select::{select, Either};
 use embassy_nrf::spim;
+use embassy_nrf::twim::{self, Twim};
 use embassy_nrf::{bind_interrupts, peripherals};
 #[cfg(not(feature = "ponger"))]
 use embassy_time::Instant;
 use embassy_time::{Duration, Timer};
+use heapless::String;
+use static_cell::StaticCell;
 
-// Bind ONLY the SPIM3 interrupt this binary uses (the LoRa SPI bus on SPI3). USBD is bound by applog — do NOT bind it
-// here. GPIOTE (DIO0 edge waits) is bound by embassy-nrf's init at the SD-safe P2 priority via init_embassy_nrf.
+// Bind the SPIM3 (LoRa SPI bus on SPI3) and TWISPI0 (shared I2C bus carrying the status OLED) interrupts this binary
+// uses. USBD is bound by applog — do NOT bind it here. GPIOTE (DIO0 edge waits) is bound by embassy-nrf's init at the
+// SD-safe P2 priority via init_embassy_nrf. One `Irqs` unit struct satisfies both drivers' Binding bounds.
 bind_interrupts!(struct Irqs {
   SPIM3 => spim::InterruptHandler<peripherals::SPI3>;
+  TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>;
 });
 
 // Operating frequency. 915 MHz is the US ISM band and matches lora-link's default. TODO: tune on hardware per your
@@ -80,6 +95,13 @@ const PING_PERIOD: Duration = Duration::from_millis(200);
 // round trip so a momentary miss is still attributed correctly. TODO: tighten once real RTT is measured.
 #[cfg(not(feature = "ponger"))]
 const ECHO_TIMEOUT: Duration = Duration::from_millis(150);
+
+// Upper bound on a single transmit. `send()` blocks until the DIO0 TX-done IRQ fires; if DIO0 is mis-wired, or SPI
+// never reached the radio (e.g. NSS not on its pad) so the chip never actually transmits, that wait never completes.
+// A real SF7/BW500 TX of this payload is only a few ms, so 250 ms over-covers it — a trip here means the radio never
+// signalled done, which we surface on the panel as a TX HANG rather than letting the loop freeze on the boot screen.
+#[cfg(not(feature = "ponger"))]
+const TX_TIMEOUT: Duration = Duration::from_millis(250);
 
 // Print a rolling statistics line every this many pings so the serial log summarizes link health at a glance.
 #[cfg(not(feature = "ponger"))]
@@ -120,6 +142,40 @@ async fn main(spawner: Spawner) {
     board::LORA_RESET_PORT, board::LORA_RESET_PIN, board::LORA_DIO0_PORT, board::LORA_DIO0_PIN
   );
 
+  // Bring up the status OLED on the shared I2C bus (TWISPI0) — the primary readout here. NON-FATAL: a panel that is
+  // absent or miswired must not stop the link test, so on init failure we log and fall through with `None`, staying
+  // serial-only. The TWIM tx_ram_buffer must be 'static (StaticCell); 16 bytes covers ssd1306's small command writes
+  // (the framebuffer is flushed from ssd1306's own RAM buffer, not this one). Mirrors the truck-diag/oled bin.
+  static TWIM_TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
+  let tx_buf = TWIM_TX_BUF.init([0; 16]);
+  // Enable the nRF INTERNAL SDA/SCL pull-ups. With the open-drain I2C bus, a panel lacking its own pull-ups (or long
+  // bench jumpers) leaves the lines floating and every transfer NAKs — the dark-screen-with-good-power signature.
+  // The internal pulls are weak (~13 kOhm) but enough for one device on short wires, and harmless if the module
+  // already pulls. (embassy-nrf gates BOTH lines off `sda_pullup` in one code path, so set both to be safe.)
+  let mut i2c_cfg = twim::Config::default();
+  i2c_cfg.sda_pullup = true;
+  i2c_cfg.scl_pullup = true;
+  let mut i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, i2c_cfg, tx_buf);
+  // Probe 0x3C/0x3D FIRST so a non-responding bus (wrong/swapped SDA-SCL pins, no pull-ups, no panel) is reported
+  // distinctly from a panel that answers but fails init (wrong driver — e.g. an SH1106 sold as an SSD1306).
+  let mut oled = match display::probe_address(&mut i2c).await {
+    Some(addr) => match display::StatusDisplay::new_with_addr(i2c, addr).await {
+      Ok(d) => {
+        applog::log_println!("OLED found at 0x{:02X}, init OK — mirroring status to the panel", addr);
+        Some(d)
+      }
+      Err(e) => {
+        applog::log_println!("OLED at 0x{:02X} answered but init FAILED ({:?}) — wrong panel (SH1106?). Serial-only", addr, e);
+        None
+      }
+    },
+    None => {
+      applog::log_println!("OLED NOT FOUND on I2C (no ACK at 0x3C/0x3D) — serial-only. Check SDA->D2/P0.17 and");
+      applog::log_println!("SCL->D3/P0.20 are correct + not swapped, GND is common, and pull-ups are present.");
+      None
+    }
+  };
+
   // Bring up the radio via the shared nrf-adapters helper (the SPIM + NSS/RESET/DIO0 glue the nodes also use, fixing
   // SF7/BW500/CR4-5 @ 915 MHz). It returns Result, so on failure DO NOT panic silently — log the error and park,
   // because an error here almost always means a wiring fault (NSS/RESET/DIO0 or a SPI line), which is exactly what
@@ -131,13 +187,33 @@ async fn main(spawner: Spawner) {
   )
   .await
   {
-    Ok(link) => {
-      applog::log_println!("radio init: OK");
+    Ok((link, version)) => {
+      // The SX127x version register reads 0x12 only when SCK/MOSI/MISO/NSS all reach the chip. 0x00 (MISO stuck
+      // low) or 0xFF (floating) means the SPI bus is dead — which a TX HANG alone could not separate from a DIO0
+      // or RF fault. Surface it on serial AND hold it on the panel for a moment before the role's loop takes over.
+      let spi_ok = version == nrf_adapters::lora::SX127X_VERSION;
+      applog::log_println!(
+        "radio init: OK | SX127x version 0x{:02X} -> {}",
+        version,
+        if spi_ok { "SPI OK (fault is DIO0/RF, not SPI)" } else { "SPI NOT TALKING - check SCK/MOSI/MISO/NSS" }
+      );
+      if let Some(o) = oled.as_mut() {
+        let mut l: String<24> = String::new();
+        let _ = write!(l, "chip ver 0x{:02X}", version);
+        let verdict = if spi_ok { "SPI OK" } else { "SPI DEAD: check wires" };
+        let _ = o.render_lines(&["LORA radio init", &l, verdict]).await;
+        // Hold the verdict long enough to read; the pinger/ponger boot screen overwrites it right after.
+        Timer::after(Duration::from_secs(3)).await;
+      }
       link
     }
     Err(e) => {
       applog::log_println!("radio init: FAILED ({:?})", e);
       applog::log_println!("check SPI wiring (SCK/MOSI/MISO), NSS, RESET, DIO0, and 3.3 V power to the radio. Parked.");
+      // Surface the wiring fault on the panel too, so a bench check needs no serial tether.
+      if let Some(mut o) = oled {
+        let _ = o.render_lines(&["LORA PING", "RADIO INIT FAILED", "check SPI/NSS", "RESET/DIO0/pwr", "parked"]).await;
+      }
       loop {
         Timer::after(Duration::from_secs(3600)).await;
       }
@@ -145,9 +221,9 @@ async fn main(spawner: Spawner) {
   };
 
   #[cfg(not(feature = "ponger"))]
-  pinger(link).await;
+  pinger(link, oled).await;
   #[cfg(feature = "ponger")]
-  ponger(link).await;
+  ponger(link, oled).await;
 }
 
 /// PINGER role. Maintains a u32 sequence counter; for each ping it records t0, transmits the seq + PING_MAGIC, then
@@ -155,7 +231,10 @@ async fn main(spawner: Spawner) {
 /// prints it with the echo's RSSI/SNR; it also tracks running min/avg/max RTT and a lost count, printed every
 /// STATS_EVERY pings. A timeout prints an explicit wiring/power hint rather than deadlocking. Never returns.
 #[cfg(not(feature = "ponger"))]
-async fn pinger(mut link: nrf_adapters::lora::Link) -> ! {
+async fn pinger<I: embedded_hal_async::i2c::I2c>(
+  mut link: nrf_adapters::lora::Link,
+  mut oled: Option<display::StatusDisplay<I>>,
+) -> ! {
   applog::log_println!(
     "pinger: sending one ping every {} ms, echo timeout {} ms",
     PING_PERIOD.as_millis(),
@@ -174,19 +253,55 @@ async fn pinger(mut link: nrf_adapters::lora::Link) -> ! {
   let mut recv: u32 = 0;
   let mut lost: u32 = 0;
 
+  // Last good RSSI/SNR, held so the panel keeps showing the most recent signal quality across a lost ping rather
+  // than blanking. They stay at 0 until the first valid echo lands.
+  let mut last_rssi: i16 = 0;
+  let mut last_snr: i16 = 0;
+
+  // Boot screen: drawn once before the first ping so a SINGLE powered board immediately proves its OLED works,
+  // rather than looking dead until traffic flows. The per-ping render below overwrites this within ~one PING_PERIOD.
+  if let Some(o) = oled.as_mut() {
+    let _ = o.render_lines(&["LORA PINGER", "booting...", "pinging, awaiting echo"]).await;
+  }
+
   loop {
     let mut payload = [0u8; PAYLOAD_LEN];
     payload[0..4].copy_from_slice(&seq.to_le_bytes());
     payload[4] = PING_MAGIC;
 
     let t0 = Instant::now();
-    if let Err(e) = link.send(&payload, OUTPUT_POWER_DBM).await {
-      // A TX error is a radio/SPI problem, not a missing peer — surface it distinctly from a lost echo.
-      applog::log_println!("seq {}: TX error: {:?}", seq, e);
-      Timer::after(PING_PERIOD).await;
-      seq = seq.wrapping_add(1);
-      continue;
+    // Bounded TX so a never-completing transmit (mis-wired DIO0, or SPI/NSS never configuring the radio) becomes a
+    // visible, counted state on the panel instead of freezing the loop. A timeout here is the fingerprint of a radio
+    // control-line fault; a clean send that then never gets an echo is an RF/peer fault (the LOST path below).
+    match select(link.send(&payload, OUTPUT_POWER_DBM), Timer::after(TX_TIMEOUT)).await {
+      Either::First(Ok(())) => {}
+      Either::First(Err(e)) => {
+        // A TX error is a radio/SPI problem, not a missing peer — surface it distinctly from a lost echo.
+        applog::log_println!("seq {}: TX error: {:?}", seq, e);
+        if let Some(o) = oled.as_mut() {
+          let mut l: String<24> = String::new();
+          let _ = write!(l, "seq {}", seq);
+          let _ = o.render_lines(&["LORA PINGER", "TX ERROR", &l, "check radio / SPI"]).await;
+        }
+        Timer::after(PING_PERIOD).await;
+        seq = seq.wrapping_add(1);
+        continue;
+      }
+      Either::Second(()) => {
+        applog::log_println!("seq {}: TX HANG (no TX-done IRQ) — check DIO0->D0, NSS->D20, and SPI wiring", seq);
+        if let Some(o) = oled.as_mut() {
+          let mut l: String<24> = String::new();
+          let _ = write!(l, "seq {}", seq);
+          let _ = o.render_lines(&["LORA PINGER", "** TX HANG **", &l, "DIO0->D0 NSS->D20", "radio not done"]).await;
+        }
+        Timer::after(PING_PERIOD).await;
+        seq = seq.wrapping_add(1);
+        continue;
+      }
     }
+
+    // The RTT for this ping if a valid echo lands, else `None` — used to drive the panel's RTT/LOST line below.
+    let mut rtt_this: Option<u64> = None;
 
     // Await the echo, bounded so a lost pong never deadlocks the loop.
     match select(link.receive_with_status(&mut rx_buf), Timer::after(ECHO_TIMEOUT)).await {
@@ -201,6 +316,9 @@ async fn pinger(mut link: nrf_adapters::lora::Link) -> ! {
           if rtt_us > max_us {
             max_us = rtt_us;
           }
+          rtt_this = Some(rtt_us);
+          last_rssi = status.rssi;
+          last_snr = status.snr;
           applog::log_println!("seq {}: RTT {} us | RSSI {} dBm | SNR {} dB", seq, rtt_us, status.rssi, status.snr);
         } else {
           // A packet arrived but it was not our echo (wrong seq or magic): count it as lost for this seq and note it.
@@ -219,6 +337,30 @@ async fn pinger(mut link: nrf_adapters::lora::Link) -> ! {
           seq,
           ECHO_TIMEOUT.as_millis()
         );
+      }
+    }
+
+    // Mirror this ping's outcome to the panel (the primary readout). Done here, AFTER the RTT was timed, so the slow
+    // I2C flush never inflates the measurement. Five short lines: title, RTT-or-LOST, the last good RSSI/SNR, the seq,
+    // and the running lost count + average RTT once any echo has landed.
+    if let Some(o) = oled.as_mut() {
+      let mut l_rtt: String<24> = String::new();
+      match rtt_this {
+        Some(us) => { let _ = write!(l_rtt, "RTT {} us", us); }
+        None => { let _ = write!(l_rtt, "** LOST **"); }
+      }
+      let mut l_sig: String<24> = String::new();
+      let _ = write!(l_sig, "RSSI {} SNR {}", last_rssi, last_snr);
+      let mut l_seq: String<24> = String::new();
+      let _ = write!(l_seq, "seq {}", seq);
+      let mut l_stat: String<24> = String::new();
+      if recv > 0 {
+        let _ = write!(l_stat, "lost {} avg {}us", lost, sum_us / recv as u64);
+      } else {
+        let _ = write!(l_stat, "lost {} no echo yet", lost);
+      }
+      if let Err(e) = o.render_lines(&["LORA PINGER", &l_rtt, &l_sig, &l_seq, &l_stat]).await {
+        applog::log_println!("OLED render error: {:?} — check SDA/SCL + power", e);
       }
     }
 
@@ -255,11 +397,22 @@ fn valid_echo(buf: &[u8], expected_seq: u32) -> bool {
 /// magic bumped to PONG_MAGIC so the direction is visible on the wire) and prints the seq + RSSI/SNR it heard. This
 /// exercises the ponger's own RX->TX turnaround and the full SPI/NSS/RESET/DIO0 path on its board. Never returns.
 #[cfg(feature = "ponger")]
-async fn ponger(mut link: nrf_adapters::lora::Link) -> ! {
+async fn ponger<I: embedded_hal_async::i2c::I2c>(
+  mut link: nrf_adapters::lora::Link,
+  mut oled: Option<display::StatusDisplay<I>>,
+) -> ! {
   applog::log_println!("ponger: listening, will echo every packet back with magic 0x{:02X}", PONG_MAGIC);
   applog::log_println!("");
 
   let mut rx_buf = [0u8; lora_link::MAX_PAYLOAD as usize];
+  // Running count of packets echoed, shown on the panel as a simple liveness/throughput indicator.
+  let mut count: u32 = 0;
+
+  // Boot screen: the ponger only renders on RX, so without this it would sit blank (indistinguishable from a dead
+  // panel) until the pinger appears. Draw a listening banner once so a single powered board proves its OLED works.
+  if let Some(o) = oled.as_mut() {
+    let _ = o.render_lines(&["LORA PONGER", "listening...", "(awaiting first ping)"]).await;
+  }
 
   loop {
     let (len, status) = match link.receive_with_status(&mut rx_buf).await {
@@ -271,16 +424,18 @@ async fn ponger(mut link: nrf_adapters::lora::Link) -> ! {
     };
 
     // Decode the seq for the log if the packet is the expected shape; otherwise still echo whatever we got so the
-    // pinger's mismatch path is exercised too, but flag it.
-    if len == PAYLOAD_LEN && rx_buf[4] == PING_MAGIC {
+    // pinger's mismatch path is exercised too, but flag it. `heard_seq` is None for a non-ping payload.
+    let heard_seq = if len == PAYLOAD_LEN && rx_buf[4] == PING_MAGIC {
       let seq = u32::from_le_bytes([rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]]);
       applog::log_println!("heard seq {}: RSSI {} dBm | SNR {} dB — echoing", seq, status.rssi, status.snr);
+      Some(seq)
     } else {
       applog::log_println!(
         "heard {} bytes (not a ping payload): RSSI {} dBm | SNR {} dB — echoing",
         len, status.rssi, status.snr
       );
-    }
+      None
+    };
 
     // Echo the same payload back, bumping the magic byte so the pinger can confirm it is a pong, not its own TX
     // leaking back. Only the magic is touched; the seq is preserved so the pinger can match it to its t0.
@@ -290,6 +445,24 @@ async fn ponger(mut link: nrf_adapters::lora::Link) -> ! {
     echo[4] = PONG_MAGIC;
     if let Err(e) = link.send(&echo, OUTPUT_POWER_DBM).await {
       applog::log_println!("echo TX error: {:?}", e);
+    }
+    count = count.wrapping_add(1);
+
+    // Mirror to the panel (primary readout): title, last heard seq (or `?` for a non-ping payload), its RSSI/SNR, and
+    // the running echo count. Done after the echo TX so it never delays the turnaround the pinger is timing.
+    if let Some(o) = oled.as_mut() {
+      let mut l_seq: String<24> = String::new();
+      match heard_seq {
+        Some(seq) => { let _ = write!(l_seq, "heard seq {}", seq); }
+        None => { let _ = write!(l_seq, "heard ? ({} B)", len); }
+      }
+      let mut l_sig: String<24> = String::new();
+      let _ = write!(l_sig, "RSSI {} SNR {}", status.rssi, status.snr);
+      let mut l_cnt: String<24> = String::new();
+      let _ = write!(l_cnt, "echoed {}", count);
+      if let Err(e) = o.render_lines(&["LORA PONGER", &l_seq, &l_sig, &l_cnt]).await {
+        applog::log_println!("OLED render error: {:?} — check SDA/SCL + power", e);
+      }
     }
   }
 }

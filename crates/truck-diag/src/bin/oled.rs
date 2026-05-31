@@ -66,13 +66,35 @@ async fn main(spawner: Spawner) {
   // framebuffer (ssd1306 flushes from its own RAM buffer), so 16 bytes is ample.
   static TWIM_TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
   let tx_buf = TWIM_TX_BUF.init([0; 16]);
-  let i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, twim::Config::default(), tx_buf);
+  // Enable the nRF internal SDA/SCL pull-ups so a panel without its own (or long bench wires) still drives the
+  // open-drain bus instead of leaving it floating and NAKing every transfer. Both flags set (embassy-nrf gates both
+  // lines off sda_pullup in one path); weak ~13 kOhm, harmless if the module already pulls.
+  let mut i2c_cfg = twim::Config::default();
+  i2c_cfg.sda_pullup = true;
+  i2c_cfg.scl_pullup = true;
+  let mut i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, i2c_cfg, tx_buf);
 
-  let mut oled = match display::StatusDisplay::new(i2c).await {
+  // Probe 0x3C/0x3D first so a dead bus (wrong/swapped pins, no pull-ups, no panel) is reported distinctly from a
+  // panel that answers but fails init. This is the no-serial isolation test: a GOOD bus then animates below.
+  let addr = match display::probe_address(&mut i2c).await {
+    Some(a) => {
+      applog::log_println!("OLED ACK at 0x{:02X} — initializing.", a);
+      a
+    }
+    None => {
+      applog::log_println!("OLED NOT FOUND (no ACK at 0x3C/0x3D). Check SDA->P{}.{:02}, SCL->P{}.{:02} (not swapped),",
+        board::I2C_SDA_PORT, board::I2C_SDA_PIN, board::I2C_SCL_PORT, board::I2C_SCL_PIN);
+      applog::log_println!("common GND, and pull-ups. Parking.");
+      loop {
+        Timer::after(Duration::from_secs(3600)).await;
+      }
+    }
+  };
+  let mut oled = match display::StatusDisplay::new_with_addr(i2c, addr).await {
     Ok(d) => d,
     Err(e) => {
-      applog::log_println!("OLED init FAILED ({:?})", e);
-      applog::log_println!("check SDA/SCL wiring + panel address (0x3C/0x3D) + power, then re-flash. Parking.");
+      applog::log_println!("OLED at 0x{:02X} answered but init FAILED ({:?}) — likely an SH1106, not an SSD1306.", addr, e);
+      applog::log_println!("Parking.");
       loop {
         Timer::after(Duration::from_secs(3600)).await;
       }

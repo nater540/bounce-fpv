@@ -21,7 +21,7 @@
 //!   pins.lora_sck, pins.lora_mosi, pins.lora_miso, pins.lora_nss, pins.lora_reset, pins.lora_dio0,
 //!   TX_BOOST,
 //! ).await {
-//!   Ok(link) => link,
+//!   Ok((link, ver)) => { /* ver == 0x12 confirms SPI reaches the SX1276 */ link }
 //!   Err(e) => { applog::log_println!("radio init FAILED ({:?}) — parked", e); loop { /* park */ } }
 //! };
 //! ```
@@ -34,6 +34,7 @@ use embassy_nrf::interrupt::typelevel::Binding;
 use embassy_nrf::spim::{self, Spim};
 use embassy_nrf::Peri;
 use embassy_time::Delay;
+use embedded_hal_async::spi::SpiDevice;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use lora_link::{LoraLink, Sx1276Radio};
 use lora_phy::mod_params::RadioError;
@@ -50,8 +51,18 @@ pub type Radio = Sx1276Radio<RadioSpi, Output<'static>, Input<'static>>;
 /// truck-node, and lora-ping so the radio type can never drift between them.
 pub type Link = LoraLink<Radio, Delay>;
 
+/// SX127x version register address (read). A genuine SX1276/RFM95W returns [`SX127X_VERSION`] here; reading it
+/// over raw SPI before lora-phy takes the bus is a cheap chip-presence probe (see [`build_lora_link`]).
+pub const SX127X_REG_VERSION: u8 = 0x42;
+
+/// The value [`SX127X_REG_VERSION`] reads on a working SX1276. Anything else (commonly 0x00 with MISO low, or 0xFF
+/// with it high/floating) means the SPI path is not reaching the chip — bad SCK/MOSI/MISO/NSS or no power.
+pub const SX127X_VERSION: u8 = 0x12;
+
 /// Builds the SX1276/RFM95W [`Link`] from the SPIM peripheral, the binding for its interrupt, and the six LoRa
-/// pins, returning the [`RadioError`] instead of panicking so the caller can log-and-park on a wiring fault.
+/// pins. Returns the link paired with the **SX127x version register** read off the bus during bring-up — `0x12`
+/// ([`SX127X_VERSION`]) confirms SPI actually reaches the chip; any other value points at the SPI wiring rather
+/// than the radio/RF. Returns the [`RadioError`] instead of panicking so the caller can log-and-park on a fault.
 ///
 /// `spim` is the SPIM instance (e.g. `SPI3`); `irqs` is the binding from the binary's `bind_interrupts!`; the
 /// pins are in SPI-then-control order (sck/mosi/miso, then nss/reset/dio0). `tx_boost` drives the RFM95W's
@@ -67,7 +78,7 @@ pub async fn build_lora_link<T, IRQ>(
   reset: Peri<'static, impl Pin>,
   dio0: Peri<'static, impl Pin>,
   tx_boost: bool,
-) -> Result<Link, RadioError>
+) -> Result<(Link, u8), RadioError>
 where
   T: spim::Instance,
   IRQ: Binding<T::Interrupt, spim::InterruptHandler<T>> + 'static,
@@ -80,6 +91,16 @@ where
   let dio0 = Input::new(dio0, Pull::None);
   // ExclusiveDevice::new is infallible here (the bus + CS are owned, never shared), but it returns Result; map
   // its error into the radio error path so this helper has a single Result type for callers to match on.
-  let spi_dev = ExclusiveDevice::new(spi_bus, nss, Delay).map_err(|_| RadioError::SPI)?;
-  lora_link::build_sx1276(spi_dev, reset, dio0, Delay, tx_boost).await
+  let mut spi_dev = ExclusiveDevice::new(spi_bus, nss, Delay).map_err(|_| RadioError::SPI)?;
+
+  // Chip-presence probe: read the version register over SPI BEFORE lora-phy resets/configures the chip. An SX127x
+  // read frame is [address-with-bit7-clear, dummy]; the device returns the register byte in the second slot. This
+  // distinguishes a dead SPI/NSS path (0x00/0xFF) from a wiring-good radio whose TX/RX hangs on a DIO0 or RF fault
+  // — a hung transmit alone cannot tell those apart. lora-phy reconfigures right after, so this read is harmless.
+  let mut frame = [SX127X_REG_VERSION, 0x00];
+  spi_dev.transfer_in_place(&mut frame).await.map_err(|_| RadioError::SPI)?;
+  let version = frame[1];
+
+  let link = lora_link::build_sx1276(spi_dev, reset, dio0, Delay, tx_boost).await?;
+  Ok((link, version))
 }

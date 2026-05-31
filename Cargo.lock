@@ -1082,12 +1082,16 @@ dependencies = [
  "applog",
  "board",
  "cortex-m-rt",
+ "display",
  "embassy-executor",
  "embassy-futures",
  "embassy-nrf",
  "embassy-time",
+ "embedded-hal-async",
+ "heapless 0.9.3",
  "lora-link",
  "nrf-adapters",
+ "static_cell",
 ]
 
 [[package]]
@@ -1185,6 +1189,7 @@ dependencies = [
  "embassy-nrf",
  "embassy-time",
  "embedded-hal 1.0.0",
+ "embedded-hal-async",
  "embedded-hal-bus",
  "embedded-io-async 0.7.0",
  "lora-link",

@@ -141,7 +141,8 @@ mod board {
   pub type LoraMosiPin = Peri<'static, peripherals::P0_11>; //  SX1276 SPI MOSI (D7 pad). NOT the board MOSI pad
   //  P0.10 — that is NFC2 and only exists as GPIO under embassy-nrf's `nfc-pins-as-gpio` feature (not enabled).
   pub type LoraMisoPin = Peri<'static, peripherals::P1_11>; //  SX1276 SPI MISO (board MISO pad).
-  pub type LoraNssPin = Peri<'static, peripherals::P0_12>; //  SX1276 chip-select (Output, ExclusiveDevice).
+  pub type LoraNssPin = Peri<'static, peripherals::P0_29>; //  SX1276 chip-select (Output, ExclusiveDevice; D20 pad).
+  //  P0.12 is NOT broken out on the Nice!Nano v2 (it is absent from the official pinout), so NSS uses the free D20 pad.
   pub type LoraResetPin = Peri<'static, peripherals::P0_06>; //  SX1276 RESET (Output, active-low; TX pad).
   pub type LoraDio0Pin = Peri<'static, peripherals::P0_08>; //  SX1276 DIO0 IRQ (Input via GPIOTE).
   pub type I2cSdaPin = Peri<'static, peripherals::P0_17>; //  shared I2C SDA (board SDA pad): MPU-6050 + SSD1306.
@@ -166,7 +167,7 @@ mod board {
   pub const LORA_MISO_PORT: u8 = 1;
   pub const LORA_MISO_PIN: u8 = 11;
   pub const LORA_NSS_PORT: u8 = 0;
-  pub const LORA_NSS_PIN: u8 = 12;
+  pub const LORA_NSS_PIN: u8 = 29;
   pub const LORA_RESET_PORT: u8 = 0;
   pub const LORA_RESET_PIN: u8 = 6;
   pub const LORA_DIO0_PORT: u8 = 0;
@@ -182,7 +183,7 @@ mod board {
 }
 
 role_accessors!(
-  P0_02, P1_00, P0_22, P0_24, P1_13, P0_11, P1_11, P0_12, P0_06, P0_08, P0_17, P0_20, P1_04, P1_06,
+  P0_02, P1_00, P0_22, P0_24, P1_13, P0_11, P1_11, P0_29, P0_06, P0_08, P0_17, P0_20, P1_04, P1_06,
 );
 
 pub use board::*;

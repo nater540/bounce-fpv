@@ -16,6 +16,13 @@ lora-link = { workspace = true }
 # Shared SX1276/RFM95W bring-up (SPIM + NSS/RESET/DIO0 glue) used by the nodes too; returns Result so this prototype
 # can log-and-park on a wiring fault instead of panicking. It owns the ExclusiveDevice + embedded-hal-bus `async` dep.
 nrf-adapters = { workspace = true }
+# Status OLED: the link test's PRIMARY readout (USB-CDC serial on these boards is fiddly). `display` is generic over
+# an embedded-hal-async I2C, which the bound on the pinger/ponger render helpers names; heapless backs the on-panel
+# line formatting; static_cell gives the Twim's tx_ram_buffer its 'static home (mirrors the truck-diag/oled bin).
+display = { workspace = true }
+embedded-hal-async = { workspace = true }
+heapless = { workspace = true }
+static_cell = { workspace = true }
 
 embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
 embassy-nrf = { workspace = true }

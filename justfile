@@ -82,9 +82,18 @@ flash bin="nrf-spike" features="": (uf2 bin features)
     exit 1
   fi
   echo "Flashing $uf2 -> $vol"
-  # The board reboots and ejects the volume mid-copy, so a copy error here is benign.
-  cp "$uf2" "$vol/" || true
+  # The board reboots and ejects the volume mid-copy, so a copy error here is benign. `-X` skips macOS extended
+  # attributes — those are written AFTER the data and fail with "Device not configured" once the volume ejects,
+  # which is just noise; the image itself is already on the board by then.
+  cp -X "$uf2" "$vol/" || true
   echo "Flashed. The board is rebooting into the app."
+
+# LoRa link test, the two roles of the `lora-ping` bin. Flash ONE board with `flash-pinger` and the OTHER with
+# `flash-ponger`, then power both: each mirrors its status to its SSD1306 (RTT/RSSI/seq on the pinger, heard
+# seq/RSSI/count on the ponger), so no serial tether is needed. These are thin aliases over `flash` — the role
+# is the `ponger` Cargo feature, easy to forget on the bare `just flash lora-ping ponger` form.
+flash-pinger: (flash "lora-ping")
+flash-ponger: (flash "lora-ping" "ponger")
 
 # Open the USB CDC serial monitor. With no arg it picks the most-recently-enumerated port (the board you just
 # flashed/plugged); permanent fixtures like docks sort older. Pass a port to override: just monitor <port>.

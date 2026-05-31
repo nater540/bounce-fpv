@@ -144,7 +144,11 @@ async fn main(spawner: Spawner) {
   )
   .await
   {
-    Ok(link) => link,
+    Ok((link, version)) => {
+      // 0x12 confirms SPI reaches the SX1276; any other value flags a dead SCK/MOSI/MISO/NSS path at boot.
+      applog::log_println!("radio init OK | SX127x version 0x{:02X}", version);
+      link
+    }
     Err(e) => {
       applog::log_println!("radio init FAILED ({:?})", e);
       loop {

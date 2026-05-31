@@ -1,0 +1,14 @@
+[package]
+name = "proto"
+version.workspace = true
+edition.workspace = true
+
+# Shared LoRa wire format for the bidirectional (half-duplex) link. Owns headtrack.proto and runs micropb-gen in
+# build.rs, re-exporting the generated no_std/no-alloc types so both node binaries define the schema exactly once.
+[dependencies]
+micropb = { workspace = true }
+
+# micropb-gen (codegen) runs in build.rs and is kept in lockstep with the micropb runtime via the workspace matrix
+# (both 0.6); see the root [workspace.dependencies] note on why they must share major.minor.
+[build-dependencies]
+micropb-gen = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "board"
+version.workspace = true
+edition.workspace = true
+
+# Board pin-map crate. This is the ONE driver-side crate that legitimately touches esp-hal concrete
+# peripheral/pin types: it destructures `esp_hal::peripherals::Peripherals` into a named struct of
+# the exact pins each subsystem uses, so the node binaries never hard-code GPIO numbers. Variants
+# (XIAO vs DevKitC-1) differ only in pin numbers and are selected by Cargo feature, not by crate.
+[dependencies]
+esp-hal = { workspace = true }
+
+[features]
+# `board-xiao` is the default target (Seeed XIAO ESP32-C6). `board-devkit` selects the Espressif
+# DevKitC-1 pin-out. Exactly one must be active; the pin-map module is chosen by these flags.
+default = ["board-xiao"]
+board-xiao = []
+board-devkit = []

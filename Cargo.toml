@@ -1,0 +1,134 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/proto",        # .proto schema + micropb-gen codegen, shared by both nodes
+  "crates/ppm-diag",     # Phase 0 diagnostic binary (already exists)
+  "crates/lora-ping",    # standalone LoRa link bring-up prototype (ping-pong RTT + wiring check)
+  "crates/truck-diag",   # truck peripheral bring-up diagnostics: servo / imu / oled / gps bins
+  "crates/goggle-node",  # binary: PPM reader -> LoRa TX
+  "crates/truck-node",   # binary: LoRa RX -> servos + IMU + OLED
+  "crates/board",        # pin-maps; board-xiao / board-devkit feature selection
+  "crates/ppm-decoder",  # reusable PPM frame decoder
+  "crates/lora-link",    # LoRa radio setup + TX/RX helpers (lora-phy / SX1276)
+  "crates/servo",        # LEDC servo PWM mapping
+  "crates/imu",          # MPU-6050 home/center detection
+  "crates/display",      # SSD1306 OLED status
+  "crates/gps",          # UART NMEA ground-speed reader (bonus)
+  "crates/nrf-spike",    # Phase A de-risk spike: SoftDevice + USB-CDC + 1 Hz blinky on nRF52840
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+# Known-good esp-hal 1.1 + Embassy matrix, locked by generating a fresh
+# `esp-generate --chip esp32c6 -o unstable-hal -o embassy -o log` project and copying its pins.
+#
+[workspace.dependencies]
+esp-hal = { version = "~1.1.0", features = ["esp32c6", "unstable"] }
+esp-rtos = { version = "0.3.0", features = ["embassy", "esp32c6"] }
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["esp32c6"] }
+embassy-executor = { version = "0.10.0" }
+embassy-time = { version = "0.5.0" }
+# `log-04` is the renamed `log` feature; `jtag-serial` routes println! over the built-in USB Serial/JTAG (the C6's single USB-C cable).
+# Default-features are off because the default `auto` console conflicts with explicitly selecting `jtag-serial`; `colors` and
+# `critical-section` are the remaining default pieces we still want.
+esp-println = { version = "0.17.0", default-features = false, features = [
+  "esp32c6",
+  "log-04",
+  "jtag-serial",
+  "colors",
+  "critical-section",
+] }
+log = "0.4.27"
+
+# embassy-sync/-embedded-hal/-futures are pinned to exactly what esp-rtos 0.3 and esp-hal 1.1
+# already pull in (sync ^0.8, embedded-hal ^0.6, futures ^0.1) so the workspace shares one copy
+# rather than duplicating the embassy stack. embassy-embedded-hal carries the shared-I2C-bus
+# (`shared_bus`) wrapper for the MPU-6050 + OLED on the truck node.
+embassy-sync = { version = "0.8.0" }
+embassy-embedded-hal = { version = "0.6.0" }
+embassy-futures = { version = "0.1.2" }
+
+# LoRa radio + protobuf wire format. micropb-gen is a build-dependency (proto's build.rs); it is
+# listed here so the proto crate references it as `micropb-gen = { workspace = true }` under
+# [build-dependencies]. The heapless container feature backs no-alloc repeated/string fields.
+lora-phy = { version = "3.0.1" }
+# micropb (runtime) and micropb-gen (codegen) are versioned in lockstep and MUST share major.minor: the
+# generated code calls runtime macros whose signatures change between releases, so a skew (e.g. 0.6 vs 0.4)
+# yields `expected Option, found Result` compile errors in the generated module. Keep both on 0.6.
+micropb = { version = "0.6", features = ["container-heapless-0-9"] }
+micropb-gen = { version = "0.6" }
+
+# Display + graphics. ssd1306 `async` uses embedded-hal-async for the I2C transfers. ssd1306 0.10 does not
+# re-export its error type, so the display crate names `display-interface`'s `DisplayError` directly and must
+# pin the exact same version ssd1306 0.10 builds on (0.5).
+ssd1306 = { version = "0.10", features = ["async"] }
+embedded-graphics = { version = "0.8" }
+display-interface = { version = "0.5.0" }
+
+# IMU. mpu6050-dmp 0.6.1 is the current crates.io release and is async-capable; confirm at compile
+# time that its async I2C path matches the embedded-hal-async 1.0 traits esp-hal exposes. `async` enables
+# its async (`sensor_async`) driver. libm supplies atan2f/sqrtf for the boot accel-to-roll/pitch home calc.
+mpu6050-dmp = { version = "0.6.1", features = ["async"] }
+libm = { version = "0.2" }
+
+# embedded-hal traits shared across drivers. embedded-io-async 0.6 is the version esp-hal 1.1's
+# async UART implements (it re-exports both 0.6 and 0.7); the GPS crate reads the NMEA byte stream
+# through it. embedded-hal-bus 0.3 provides blocking bus-sharing where a Mutex is overkill.
+embedded-hal = { version = "1" }
+embedded-hal-async = { version = "1" }
+embedded-hal-bus = { version = "0.3" }
+embedded-io-async = { version = "0.6.1" }
+
+# no_std containers + one-time static init for StaticCell-held peripherals/buses.
+# heapless is pinned to 0.9 so the node binaries can encode proto types into a heapless 0.9 `Vec<u8, N>`:
+# micropb 0.6's `container-heapless-0-9` feature implements `PbWrite` (the PbEncoder output sink) for heapless 0.9 only.
+heapless = { version = "0.9" }
+static_cell = { version = "2" }
+
+# --- nRF52840 migration (Phase A spike) ----------------------------------------------------------------
+# The esp-* deps above stay for now (removed in Phase B1); these are ADDED so the nrf-spike resolves.
+# embassy-nrf 0.10 is the current release; nrf-softdevice imposes no embassy-nrf version constraint (it only
+# pulls embassy-sync/-futures), so we take the newest. time-driver-rtc1 is mandatory: the SoftDevice owns RTC0,
+# so embassy-time must drive off RTC1. gpiote backs async GPIO edge waits (LED is output-only here, but PPM/DIO0
+# need it in later phases). unstable-pac exposes the raw PAC the SD-init clock config touches.
+embassy-nrf = { version = "0.10.0", features = ["nrf52840", "time-driver-rtc1", "gpiote", "unstable-pac"] }
+embassy-usb = { version = "0.6.0" }
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = { version = "0.7" }
+panic-halt = { version = "1.0" }
+
+# nrf-softdevice: the crates.io 0.1.0 release pins embassy-sync ^0.5, which collides with the frozen
+# workspace's embassy-sync 0.8. The git rev below (HEAD 2026-05-14) already moved to embassy-sync 0.8, so we
+# pin it via git to stay on one embassy stack. nrf-softdevice-s140 0.1.2 bundles s140 v7.0.1 (drives the
+# 0x27000 flash origin in memory.x). critical-section-impl makes nrf-softdevice the SOLE critical-section
+# provider for the workspace — no other crate may enable a critical-section impl.
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice", rev = "47d6121c6e823120e8b883a7ac75f44ce7daa3aa", features = [
+  "nrf52840",
+  "s140",
+  "ble-peripheral",
+  "critical-section-impl",
+] }
+nrf-softdevice-s140 = { git = "https://github.com/embassy-rs/nrf-softdevice", rev = "47d6121c6e823120e8b883a7ac75f44ce7daa3aa" }
+
+# Internal workspace crates.
+proto = { path = "crates/proto" }
+board = { path = "crates/board" }
+ppm-decoder = { path = "crates/ppm-decoder" }
+lora-link = { path = "crates/lora-link" }
+servo = { path = "crates/servo" }
+imu = { path = "crates/imu" }
+display = { path = "crates/display" }
+gps = { path = "crates/gps" }
+
+# Release profile tuned for embedded:
+# Optimize for size, single codegen unit + fat LTO to trim the binary, and keep full debug info for backtraces.
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"
+
+[profile.dev]
+opt-level = "s"

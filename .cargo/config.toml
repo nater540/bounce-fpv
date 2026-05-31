@@ -1,0 +1,15 @@
+[build]
+target = "thumbv7em-none-eabihf"
+# cortex-m-rt supplies link.x; each crate's build.rs puts the workspace memory.x on the linker search
+# path so link.x can INCLUDE it. No -Tlinkall.x (that was esp-hal); no build-std (prebuilt target).
+rustflags = ["-C", "link-arg=-Tlink.x"]
+
+# Pro Micro nRF52840 boards ship the Adafruit UF2 bootloader: double-tap RESET to mount the mass-storage
+# volume, then copy a .uf2. There is no probe, so flashing is a file copy. `cargo run` is left without a
+# runner because the manual UF2 step (objcopy -> uf2 -> copy to the mounted volume) is the spike workflow;
+# see the justfile / Phase A report for the exact commands. cargo-hf2 or a wrapper script can replace this later.
+
+# MID-MIGRATION NOTE: under thumbv7em-none-eabihf the esp-* binaries (ppm-diag, lora-ping, truck-diag,
+# goggle-node, truck-node) no longer build — that is expected. They still depend on esp-hal/esp-rtos and are
+# ported off ESP32-C6 in Phases C/D; only `nrf-spike` is meant to build for this target during Phase A.
+# Note: there is no [unstable] build-std here — thumbv7em-none-eabihf is prebuilt (the esp era needed core).

@@ -1,0 +1,13 @@
+[package]
+name = "lora-link"
+version.workspace = true
+edition.workspace = true
+
+# LoRa link helpers around lora-phy 3.0.1 (SX1276/RFM95W). A thin wrapper over `LoRa<RK, DLY>` that fixes
+# the low-latency P2P modulation (SF7 / BW500 / CR4-5 @ 915 MHz) and exposes send/receive, plus a builder
+# helper for the concrete `Sx127x` radio. Generic over the lora-phy RadioKind + embedded-hal-async SPI so
+# it builds standalone; the node binary supplies the esp-hal SPI/GPIO concrete types.
+[dependencies]
+lora-phy = { workspace = true }
+embedded-hal = { workspace = true }
+embedded-hal-async = { workspace = true }

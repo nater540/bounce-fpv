@@ -1,0 +1,7 @@
+# nRF52840 is ARM Cortex-M4F — stable Rust with the prebuilt thumbv7em-none-eabihf target (hard-float).
+# No espup/Xtensa fork and no build-std: this target ships precompiled, unlike the old riscv core build.
+# MSRV floor is still driven by the frozen deps (micropb runtime >= 1.88); see docs/00-overview.md.
+[toolchain]
+channel = "stable"
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["thumbv7em-none-eabihf"]

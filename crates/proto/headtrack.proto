@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+// Bidirectional (half-duplex) LoRa wire format for the FPV head-tracking system. Two directions, two messages:
+//   Control   (goggle node -> truck node): pan/tilt head-tracking command.
+//   Telemetry (truck node  -> goggle node): GPS-derived ground-speed status.
+// Scalar-only fields. Keep both messages tiny to hold LoRa air-time low.
+package headtrack;
+
+// Pan/tilt head-tracking command sent goggle -> truck. Carries the raw PPM pulse width in microseconds for each axis
+// (~1000-2000 us, ~1500 us = center), straight from the goggle PPM decoder. Raw us (not offset-from-center) keeps the
+// servo-mapping code dead simple — it maps the same us range to LEDC duty with no decode-side reconstruction — and
+// proto3 variant encoding of values < 16384 costs only 2 bytes per field, so a sint32 zigzag offset saves nothing.
+message Control {
+  uint32 pan_us = 1;   // pan PPM pulse width, microseconds (~1000-2000)
+  uint32 tilt_us = 2;  // tilt PPM pulse width, microseconds (~1000-2000)
+}
+
+// GPS-derived telemetry sent truck -> goggle. Integers only — no floats on the wire.
+message Telemetry {
+  uint32 speed_cm_s = 1;    // ground speed, centimeters/second (unit shared with the `gps` crate — keep exactly this)
+  uint32 sats = 2;          // satellites in the current fix
+  uint32 fix_quality = 3;   // fix quality, 0 = no fix
+}

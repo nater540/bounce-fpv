@@ -1,0 +1,10 @@
+[package]
+name = "ppm-decoder"
+version.workspace = true
+edition.workspace = true
+
+# Pure, hardware-free PPM frame decoder. Fed successive rising-edge interval deltas (microseconds) it
+# tracks the sync gap, accumulates per-channel widths, rejects out-of-band glitches, and yields a
+# completed frame on each sync. No esp-hal / embedded-hal deps so it builds and unit-tests standalone;
+# both ppm-diag and goggle-node feed it edge deltas captured however they like.
+[dependencies]

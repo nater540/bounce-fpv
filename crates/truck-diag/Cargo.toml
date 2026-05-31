@@ -1,0 +1,45 @@
+[package]
+name = "truck-diag"
+version.workspace = true
+edition.workspace = true
+
+# Truck-node peripheral bring-up diagnostics. ONE crate, FOUR binaries under src/bin/ (cargo auto-discovers them):
+# `servo`, `imu`, `oled`, `gps`. Each exercises ONE peripheral in ISOLATION so it can be flashed and validated on
+# hardware before the integrated truck-node run — flash one at a time, e.g.
+# `cargo run --release -p truck-diag --bin servo`. The shared panic handler + esp-idf app descriptor live in
+# `src/lib.rs` so every bin artifact picks them up without duplicating four copies. Thin: all real logic lives in the
+# servo / imu / display / gps driver crates; these bins are just on-target observation harnesses.
+[dependencies]
+board = { workspace = true }
+servo = { workspace = true }
+imu = { workspace = true }
+display = { workspace = true }
+gps = { workspace = true }
+
+# The imu bin streams live accel samples for the tilt-and-watch loop, so it drives the mpu6050-dmp async driver
+# directly (the imu crate only exposes the one-shot boot home routine) and converts each sample with the imu crate's
+# pure roll_pitch_from_accel. embedded-hal-async names the I2C/DelayNs traits those async calls bound on.
+mpu6050-dmp = { workspace = true }
+embedded-hal-async = { workspace = true }
+# The servo bin's sweep helpers are generic over servo's PWM bound, so they name embedded_hal::pwm::SetDutyCycle.
+embedded-hal = { workspace = true }
+
+esp-hal = { workspace = true }
+esp-rtos = { workspace = true }
+esp-bootloader-esp-idf = { workspace = true }
+embassy-executor = { workspace = true }
+embassy-time = { workspace = true }
+# servo's `Servo` is generic over embedded_hal::pwm::SetDutyCycle; the bin builds the LEDC channel itself but does not
+# need to name the trait. embedded-io-async backs the GPS bin's optional raw mode (Read directly off the async UART).
+embedded-io-async = { workspace = true }
+esp-println = { workspace = true }
+log = { workspace = true }
+
+[features]
+# Board variant is a pass-through feature (default XIAO); selecting `board-devkit` forwards to the board crate. The
+# `gps-raw` feature (default OFF) switches the gps bin into a byte-echo mode so a wiring/baud fault is distinguishable
+# from a parser fault — see src/bin/gps.rs.
+default = ["board-xiao"]
+board-xiao = ["board/board-xiao"]
+board-devkit = ["board/board-devkit"]
+gps-raw = []

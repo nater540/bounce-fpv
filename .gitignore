@@ -1,0 +1,20 @@
+target/
+.idea/
+
+# "file in use" markers
+hardware/**/~*.lck
+# KiCad auto-backups
+hardware/**/~*.kicad_*-bak
+# KiCad autosaves
+hardware/**/_autosave-*
+# VS Code Local History extension
+hardware/**/.history/
+# generated footprint cache
+hardware/**/fp-info-cache
+# KiCad project backup dirs
+hardware/**/*-backups/
+
+# macOS turds
+.DS_Store
+/test_move
+/trace

@@ -1,0 +1,11 @@
+[package]
+name = "gps"
+version.workspace = true
+edition.workspace = true
+
+# UART NMEA ground-speed reader (bonus). Generic over `embedded_io_async::Read` (the esp-hal async UART),
+# no_std + no-alloc: a hand-rolled minimal NMEA parser (RMC/VTG/GGA) with checksum validation feeding a
+# fixed heapless line buffer. Exposes ground speed in centimeters/second to match `Telemetry.speed_cm_s`.
+[dependencies]
+embedded-io-async = { workspace = true }
+heapless = { workspace = true }

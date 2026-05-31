@@ -1,0 +1,15 @@
+[package]
+name = "display"
+version.workspace = true
+edition.workspace = true
+
+# SSD1306 OLED status renderer over Ssd1306Async + embedded-graphics. Generic over an embedded-hal-async
+# I2C (so it shares the truck's I2C bus). Draws speed (km/h from cm/s) and a link/fix indicator, then flushes.
+[dependencies]
+ssd1306 = { workspace = true }
+embedded-graphics = { workspace = true }
+embedded-hal-async = { workspace = true }
+heapless = { workspace = true }
+# ssd1306 0.10 builds its error type on display-interface 0.5, and we name that `DisplayError` in our public
+# signatures, so we depend on the exact same version (centralized in the workspace matrix).
+display-interface = { workspace = true }

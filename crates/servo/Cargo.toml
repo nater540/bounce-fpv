@@ -1,0 +1,9 @@
+[package]
+name = "servo"
+version.workspace = true
+edition.workspace = true
+
+# MG90S servo / LEDC duty mapping. Pure integer pulse-us -> duty math (no floats) plus a thin wrapper over
+# any `embedded_hal::pwm::SetDutyCycle` channel, so the LEDC binding stays generic and the math is testable.
+[dependencies]
+embedded-hal = { workspace = true }

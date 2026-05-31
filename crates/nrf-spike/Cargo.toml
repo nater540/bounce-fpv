@@ -1,0 +1,19 @@
+[package]
+name = "nrf-spike"
+version.workspace = true
+edition.workspace = true
+
+# Phase A de-risk spike. Proves the full nRF52840 build -> flash -> observe loop with the s140 SoftDevice
+# enabled: 1 Hz blinky + a USB-CDC "alive" line, with USB HFCLK obtained through the SoftDevice. Throwaway.
+[dependencies]
+embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = { workspace = true }
+embassy-nrf = { workspace = true }
+embassy-usb = { workspace = true }
+embassy-futures = { workspace = true }
+nrf-softdevice = { workspace = true }
+nrf-softdevice-s140 = { workspace = true }
+cortex-m = { workspace = true }
+cortex-m-rt = { workspace = true }
+panic-halt = { workspace = true }
+static_cell = { workspace = true }

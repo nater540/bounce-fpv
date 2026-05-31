@@ -80,9 +80,28 @@ async fn main(spawner: Spawner) {
     assert_eq!(raw::sd_power_usbremoved_enable(1), raw::NRF_SUCCESS, "sd_power_usbremoved_enable failed");
   }
 
-  // SoftwareVbusDetect starts as "not detected": the SD's PowerUsbDetected/PowerUsbPowerReady SoC events
-  // (forwarded in softdevice_task) flip it so the USB stack only powers up once VBUS is genuinely present.
-  let vbus = VBUS.init(SoftwareVbusDetect::new(false, false));
+  // Seed SoftwareVbusDetect from the ACTUAL current USB power state, not (false, false). The USBDETECTED /
+  // USBPWRRDY SoC events are EDGE-triggered: on a board that is already USB-powered before the firmware runs
+  // (the common case here), those edges fired before Softdevice::enable, so softdevice_task never sees them
+  // and a (false, false) start would stay false forever — embassy-usb would wait for power that, as far as it
+  // knows, never arrives, and USBD would never enumerate (the classic "only enumerates after a power-cycle,
+  // not after reset" bug). Reading USBREGSTATUS via sd_power_usbregstatus_get captures the level at boot so an
+  // already-powered board starts correct and powers USBD up immediately; the *_enable calls above still cover
+  // later unplug/replug edges. USBREGSTATUS layout: bit 0 = VBUSDETECT (VBUS present), bit 1 = OUTPUTRDY (the
+  // USB 3.3 V regulator output is ready). The s140 bindings expose no named masks for these, so use the bits
+  // directly. Signature: `unsafe fn sd_power_usbregstatus_get(usbregstatus: *mut u32) -> u32` (NRF_SUCCESS on ok).
+  const USBREGSTATUS_VBUSDETECT: u32 = 1 << 0; // VBUS present on the USB connector.
+  const USBREGSTATUS_OUTPUTRDY: u32 = 1 << 1; // USB regulator 3.3 V output is ready.
+  let mut usbregstatus: u32 = 0;
+  let (vbus_detected, output_ready) = unsafe {
+    assert_eq!(
+      raw::sd_power_usbregstatus_get(&mut usbregstatus),
+      raw::NRF_SUCCESS,
+      "sd_power_usbregstatus_get failed",
+    );
+    (usbregstatus & USBREGSTATUS_VBUSDETECT != 0, usbregstatus & USBREGSTATUS_OUTPUTRDY != 0)
+  };
+  let vbus = VBUS.init(SoftwareVbusDetect::new(vbus_detected, output_ready));
 
   // Spawn the SoftDevice event loop. It must run continuously or SD calls never complete; we hook its SoC
   // events to drive the SoftwareVbusDetect so USB sees power state without touching POWER/CLOCK directly.

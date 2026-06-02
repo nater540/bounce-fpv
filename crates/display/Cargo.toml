@@ -13,3 +13,6 @@ heapless = { workspace = true }
 # ssd1306 0.10 builds its error type on display-interface 0.5, and we name that `DisplayError` in our public
 # signatures, so we depend on the exact same version (centralized in the workspace matrix).
 display-interface = { workspace = true }
+# cosf/sinf/roundf for the T1 speedo arc geometry. Already in the workspace matrix (imu uses it), so this pulls in
+# no new crate — f32::round/cos/sin need std, which this no_std crate cannot use.
+libm = { workspace = true }

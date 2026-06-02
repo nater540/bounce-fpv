@@ -338,6 +338,7 @@ dependencies = [
  "embedded-graphics",
  "embedded-hal-async",
  "heapless 0.9.3",
+ "libm",
  "ssd1306",
 ]
 

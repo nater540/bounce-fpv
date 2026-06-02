@@ -27,7 +27,6 @@
 // any per-binary defmt setup.
 use applog as _;
 
-use core::fmt::Write as _;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, Either};
 use embassy_nrf::buffered_uarte::{self, BufferedUarteRx};
@@ -40,7 +39,6 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
 use gps::GpsReader;
-use heapless::String;
 use micropb::{MessageDecode, MessageEncode, PbEncoder};
 use nrf_adapters::PwmServoChannel;
 use proto::{Control, Telemetry};
@@ -124,11 +122,14 @@ const LINK_TIMEOUT: Duration = Duration::from_millis(500);
 static CONTROL: Signal<CriticalSectionRawMutex, Control> = Signal::new();
 // Latest GPS-derived telemetry from the UART, consumed by the LoRa reply. The reader re-takes it each turnaround.
 static GPS_TELEM: Signal<CriticalSectionRawMutex, Telemetry> = Signal::new();
-// Received pan/tilt (us) for the status OLED, published by the LoRa task ALONGSIDE CONTROL — a Signal hands each
-// value to one taker, so the display needs its own copy separate from the servo loop's CONTROL. Lossy: latest only.
-static DISPLAY_CONTROL: Signal<CriticalSectionRawMutex, (u32, u32)> = Signal::new();
+// Latest GPS telemetry for the status OLED, published by gps_task ALONGSIDE GPS_TELEM (which the LoRa reply
+// consumes) — the OLED needs its own copy to render ground speed. Lossy: latest fix only.
+static SPEED_DISPLAY: Signal<CriticalSectionRawMutex, Telemetry> = Signal::new();
+// RSSI (dBm) of the most recent binding-valid Control frame, published by the LoRa task, consumed by the OLED for
+// the header signal bars + numeric readout. Published only on a decoded Control so foreign frames never move it.
+static LINK_RSSI: Signal<CriticalSectionRawMutex, i16> = Signal::new();
 // Latest LoRa link state (Connected/Tentative/Disconnected) published by the LoRa task on each change. Surfaced for
-// the status display; the OLED task does not consume it yet (the UI is being reworked) — it is here so it can.
+// the status display; the OLED derives liveness from the Control-RX timeout instead, but this stays published for logs.
 static LINK_STATE: Signal<CriticalSectionRawMutex, lora_link::LinkState> = Signal::new();
 
 // The radio type lives in `nrf_adapters::lora` now (shared by both nodes + lora-ping so it can never drift); the
@@ -266,16 +267,17 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
 
     // Bounded RX: without the timeout this awaits the DIO0 IRQ forever, so a silent goggle would park us until a
     // packet happens to land.
-    match select(link.receive(&mut rx_buf), Timer::after(RX_TIMEOUT)).await {
-      Either::First(Ok(len)) => {
+    match select(link.receive_with_status(&mut rx_buf), Timer::after(RX_TIMEOUT)).await {
+      Either::First(Ok((len, status))) => {
         if let Some(bytes) = link_id::deframe(&BINDING, &rx_buf[..len]) {
           // A frame that passes the binding (link-id + CRC) is ours. Decode the Control, publish it, then turn around
           // the Telemetry reply. The round-trip is healthy unless our own reply transmit stalls (handled below).
           let mut control = Control::default();
           if control.decode_from_bytes(bytes).is_ok() {
-            // Publish to the servo loop AND the status OLED via SEPARATE Signals (a Signal hands each value to one
-            // taker). The OLED copy is the received pan/tilt — what the servo loop acts on — so tracking stays visible.
-            DISPLAY_CONTROL.signal((control.pan_us, control.tilt_us));
+            // Publish to the servo loop (CONTROL) and the status OLED (LINK_RSSI — the header bars/number, which
+            // also serves as the OLED's link-liveness heartbeat). Published only here, in the decoded-Control
+            // branch, so foreign frames never move the bars or falsely mark the link live.
+            LINK_RSSI.signal(status.rssi);
             CONTROL.signal(control);
 
             // Refresh the reply payload from the latest GPS fix (if any), then frame + transmit the turnaround.
@@ -441,7 +443,10 @@ async fn gps_task(mut reader: GpsReader<BufferedUarteRx<'static>>) {
       Ok(fix) => {
         let sats = fix.satellites.unwrap_or(0) as u32;
         let fix_quality = fix.fix.map(|f| f.raw as u32).unwrap_or(0);
+        // Publish to BOTH the LoRa reply (GPS_TELEM) and the OLED (SPEED_DISPLAY) via separate Signals — a Signal
+        // hands each value to one taker. Build the small all-u32 struct twice rather than relying on Telemetry: Clone.
         GPS_TELEM.signal(Telemetry { speed_cm_s: fix.speed_cm_s, sats, fix_quality });
+        SPEED_DISPLAY.signal(Telemetry { speed_cm_s: fix.speed_cm_s, sats, fix_quality });
       }
       Err(_) => {
         // embassy-nrf 0.10's BufferedUarteRx Error enum is empty and a UART overrun or ring-buffer-full PANICS
@@ -454,10 +459,11 @@ async fn gps_task(mut reader: GpsReader<BufferedUarteRx<'static>>) {
   }
 }
 
-/// Status OLED task (truck). Drives the same SSD1306 the goggle uses, on the truck's I2C bus, showing the RECEIVED
-/// pan/tilt (exactly what the servo loop acts on) plus link liveness and an RX counter — so head tracking is visible
-/// on the truck even while the servos are unpowered. Probes 0x3C/0x3D; a missing or dead panel just exits the task
-/// and the node runs headless. Renders at OLED_PERIOD via render_lines, kept off the LoRa/servo hot paths.
+/// Status OLED task (truck) — the committed T1 "Arc / Center" layout: a segmented speedo arc wrapping a big MPH
+/// readout, KM/H on the baseline, and RSSI + LoRa signal bars in the header. Speed comes from the local GPS
+/// (`SPEED_DISPLAY`); the bars and link liveness both come from `LINK_RSSI` (published on each decoded Control).
+/// Probes 0x3C/0x3D; a missing or dead panel just exits the task and the node runs headless. Renders at
+/// OLED_PERIOD, kept off the LoRa/servo hot paths.
 #[embassy_executor::task]
 async fn oled_task(mut i2c: OledI2c) {
   let addr = match display::probe_address(&mut i2c).await {
@@ -477,32 +483,33 @@ async fn oled_task(mut i2c: OledI2c) {
   let _ = oled.render_lines(&["TRUCK", "waiting for", "control..."]).await;
 
   let mut ticker = Ticker::every(OLED_PERIOD);
-  // Seed at center so the panel reads a sane pose before the first Control arrives.
-  let mut pan_us: u32 = servo::CENTER_PULSE_US as u32;
-  let mut tilt_us: u32 = servo::CENTER_PULSE_US as u32;
-  let mut rx_count: u32 = 0;
+  // Latest GPS fix; defaults to zero speed/no-fix so the panel reads 0 mph with a live link before any GPS sentence.
+  let mut last = Telemetry::default();
+  // Last Control RSSI, floored so the bars read empty until the first frame (rssi_to_bars also zeroes when down).
+  let mut last_rssi: i16 = -127;
   // Last Control-RX time for link liveness, seeded in the past so the link reads down until the first packet lands.
   let mut last_rx = Instant::now().saturating_sub(LINK_TIMEOUT);
 
   loop {
     ticker.next().await;
-    if let Some((pan, tilt)) = DISPLAY_CONTROL.try_take() {
-      pan_us = pan;
-      tilt_us = tilt;
-      rx_count = rx_count.wrapping_add(1);
+    if let Some(telem) = SPEED_DISPLAY.try_take() {
+      last = telem;
+    }
+    // A decoded Control publishes LINK_RSSI; its arrival is also the link-liveness heartbeat, so stamp last_rx here.
+    if let Some(rssi) = LINK_RSSI.try_take() {
+      last_rssi = rssi;
       last_rx = Instant::now();
     }
-    let link_up = Instant::now().duration_since(last_rx) < LINK_TIMEOUT;
 
-    let mut l_title: String<24> = String::new();
-    let _ = write!(l_title, "TRUCK  LINK:{}", if link_up { "Y" } else { "N" });
-    let mut l_pan: String<24> = String::new();
-    let _ = write!(l_pan, "pan  {} us", pan_us);
-    let mut l_tilt: String<24> = String::new();
-    let _ = write!(l_tilt, "tilt {} us", tilt_us);
-    let mut l_rx: String<24> = String::new();
-    let _ = write!(l_rx, "rx {}", rx_count);
-    if let Err(e) = oled.render_lines(&[&l_title, &l_pan, &l_tilt, &l_rx]).await {
+    let linked = Instant::now().duration_since(last_rx) < LINK_TIMEOUT;
+    let status = display::TruckStatus {
+      mph: display::cm_s_to_mph(last.speed_cm_s),
+      kmh: display::cm_s_to_kmh(last.speed_cm_s),
+      bars: display::rssi_to_bars(last_rssi, linked),
+      rssi: last_rssi,
+      linked,
+    };
+    if let Err(e) = oled.render_truck(status).await {
       applog::log_println!("truck OLED render error: {:?}", e);
     }
   }

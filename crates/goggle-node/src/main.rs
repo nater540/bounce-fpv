@@ -1,20 +1,21 @@
 //! Goggle node (Phase D: nRF52840): decode the Skyzone goggle PPM head-tracking stream and drive the
-//! goggle->truck side of the half-duplex LoRa link, now with the status OLED + a lap-reset button (both moved
-//! onto the goggle in this phase).
+//! goggle->truck side of the half-duplex LoRa link, with the committed G1 "Stopwatch" status OLED + a lap
+//! button (both on the goggle in this phase).
 //!
 //! Four Embassy tasks, wired by latest-value `Signal`s (lossy — only the freshest value matters, stale samples
 //! are dropped, never queued):
 //!   - `ppm_task`    — `Input` on `pins.ppm`, `wait_for_rising_edge().await` + `Instant` deltas fed to a
-//!     `ppm_decoder::PpmDecoder`; on each decoded `Frame` it pulls the pan/tilt channels and signals `CONTROL`.
+//!     `ppm_decoder::PpmDecoder`; on each decoded `Frame` it pulls the pan/tilt channels and signals both
+//!     `CONTROL` (for the LoRa TX) and `HEAD` (the OLED's own copy of the pose).
 //!   - `lora_task`   — builds the SX1276 radio, then on a fixed ~50 Hz cadence takes the latest `Control`,
 //!     encodes it with micropb, transmits, and listens briefly for the truck's `Telemetry` reply; on a decode
-//!     it signals the ground speed into `SPEED` for the OLED.
+//!     it signals the telemetry into `SPEED` (GPS sats for the OLED) and the reply RSSI into `LINK_RSSI`.
 //!   - `oled_task`   — `display::StatusDisplay` on a direct `Twim` (the SSD1306 is the only I2C device here, so
-//!     no shared bus). Renders the truck's speed (from `SPEED`) + link/fix flags + a lap-timer line (whole
-//!     seconds since the last reset).
-//!   - `button_task` — `Input` on `pins.button` (active-low, internal pull-up); on press it signals `LAP_RESET`
-//!     so the OLED re-bases its lap-timer origin (a simple elapsed-since-reset stopwatch for now; richer lap
-//!     detection is a future TODO).
+//!     no shared bus). Renders the G1 layout: a big lap clock (SS.s) + lap number, live pan/tilt in degrees,
+//!     the GPS satellite count, and LoRa signal bars.
+//!   - `button_task` — `Input` on `pins.button` (active-low, internal pull-up); a short press signals
+//!     `LapEvent::Lap` (advance the lap), a long press (held past `LONG_PRESS`) signals `LapEvent::Reset` (back
+//!     to lap 1). The OLED owns the lap counter + stopwatch origin and re-bases them on each event.
 //!
 //! Half-duplex turnaround (scaffold scheme, tunable on hardware): the goggle is the link master. It TXes a
 //! Control, then immediately listens for one Telemetry reply with a short bounded timeout before the next
@@ -109,6 +110,10 @@ const BINDING: link_id::Binding = link_id::derive(env!("BINDING_PHRASE"));
 // OLED refresh cadence. The panel only shows a human-readable glance, so a few Hz is plenty.
 const OLED_PERIOD: Duration = Duration::from_millis(250);
 
+// Button hold time that separates a short press (LAP) from a long press (RESET). 800 ms is comfortably past a
+// deliberate tap but short enough to feel responsive when intentionally resetting. TODO: tune on hardware.
+const LONG_PRESS: Duration = Duration::from_millis(800);
+
 // Link liveness window: if no Telemetry reply has been decoded within this span, the OLED shows LINK:N. A couple
 // of TX cycles' worth of slack so a single dropped reply does not flap the flag. TODO: tune on hardware.
 const LINK_TIMEOUT: Duration = Duration::from_millis(500);
@@ -116,14 +121,29 @@ const LINK_TIMEOUT: Duration = Duration::from_millis(500);
 // Latest pan/tilt command, published by the PPM reader and consumed by the LoRa task. CriticalSectionRawMutex
 // because the Signal is a `static` shared across tasks.
 static CONTROL: Signal<CriticalSectionRawMutex, Control> = Signal::new();
-// Latest truck telemetry decoded by the LoRa task, consumed by the OLED task to render speed + fix flags.
+// Latest truck telemetry decoded by the LoRa task, consumed by the OLED task to render the GPS sat count (the
+// goggle has no local GPS — "SV nn" on G1 is the truck's fix relayed over the half-duplex telemetry).
 static SPEED: Signal<CriticalSectionRawMutex, Telemetry> = Signal::new();
-// Lap-reset edge from the button, consumed by the OLED task to reset its placeholder lap timer. The unit payload
-// is just an event marker — the OLED re-bases its elapsed-time origin when it fires.
-static LAP_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+// Latest head pan/tilt (us) published by the PPM reader ALONGSIDE CONTROL, consumed by the OLED to show the live
+// degree readouts. A Signal hands each value to ONE taker, so the OLED needs its own copy separate from CONTROL
+// (which the LoRa task consumes) — the same pattern the truck uses for its DISPLAY_CONTROL.
+static HEAD: Signal<CriticalSectionRawMutex, (u32, u32)> = Signal::new();
+// RSSI (dBm) of the most recent binding-valid Telemetry reply, published by the LoRa task, consumed by the OLED to
+// derive the header signal bars. Published only on a decoded reply so noise/foreign frames never move the bars.
+static LINK_RSSI: Signal<CriticalSectionRawMutex, i16> = Signal::new();
+// Lap-timer gesture from the button: a short press marks a new lap, a long press resets to lap 1. The OLED owns the
+// lap counter + stopwatch origin and re-bases them on each event.
+static LAP_EVENT: Signal<CriticalSectionRawMutex, LapEvent> = Signal::new();
 // Latest LoRa link state (Connected/Tentative/Disconnected) published by the LoRa task on each change. Surfaced for
-// the status display; the OLED task does not consume it yet (the UI is being reworked) — it is here so it can.
+// the status display; the OLED derives liveness from the reply timeout instead, but this stays published for logs.
 static LINK_STATE: Signal<CriticalSectionRawMutex, lora_link::LinkState> = Signal::new();
+
+/// Button gesture for the lap timer. `Copy`/`Send`, so it rides a `Signal` to the OLED task.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LapEvent {
+  Lap,   // short press: advance to the next lap and restart the stopwatch
+  Reset, // long press: return to lap 1 and restart the stopwatch
+}
 
 // The radio type lives in `nrf_adapters::lora` now (shared by both nodes + lora-ping so it can never drift); the
 // spawned LoRa task takes `nrf_adapters::lora::Link` directly for its non-generic signature.
@@ -230,6 +250,8 @@ async fn ppm_task(mut ppm: Input<'static>) {
       let pan_us = frame.channel(PAN_CHANNEL).map(u32::from).unwrap_or(CENTER_US);
       let tilt_us = frame.channel(TILT_CHANNEL).map(u32::from).unwrap_or(CENTER_US);
       CONTROL.signal(Control { pan_us, tilt_us });
+      // Publish the OLED's own copy of the head pose (independent Signal, lossy — latest frame only).
+      HEAD.signal((pan_us, tilt_us));
     }
   }
 }
@@ -282,17 +304,24 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
     match select(link.send(&framed, TX_POWER_DBM), Timer::after(TX_TIMEOUT)).await {
       Either::First(Ok(())) => {
         // Listen for the truck's Telemetry reply, bounded by REPLY_TIMEOUT so a lost reply cannot stall the loop.
-        match select(link.receive(&mut rx_buf), Timer::after(REPLY_TIMEOUT)).await {
-          Either::First(Ok(len)) => {
+        match select(link.receive_with_status(&mut rx_buf), Timer::after(REPLY_TIMEOUT)).await {
+          Either::First(Ok((len, status))) => {
             if let Some(bytes) = link_id::deframe(&BINDING, &rx_buf[..len]) {
               let mut telem = Telemetry::default();
               if telem.decode_from_bytes(bytes).is_ok() {
-                // km/h = cm_s * 36 / 1000, integer rounded — logged for the serial console; the freshest telemetry
-                // is also handed to the OLED. speed_cm_s is an externally-controllable uint32, so widen to u64
-                // first so the product can never wrap (review fix #3).
-                let kmh = ((telem.speed_cm_s as u64 * 36 + 500) / 1000) as u32;
-                applog::log_println!("telemetry: {} km/h | sats {} | fix {}", kmh, telem.sats, telem.fix_quality);
+                // Log km/h for the serial console (the freshest telemetry is also handed to the OLED). Use the
+                // display crate's shared converter so the goggle log and the truck OLED can't drift apart — it does
+                // the same u64-widened integer rounding (the speed_cm_s overflow fix lives in one place now).
+                applog::log_println!(
+                  "telemetry: {} km/h | sats {} | fix {}",
+                  display::cm_s_to_kmh(telem.speed_cm_s),
+                  telem.sats,
+                  telem.fix_quality
+                );
                 SPEED.signal(telem);
+                // Publish the reply's RSSI for the OLED signal bars — only here, inside the decoded-reply branch, so
+                // foreign/corrupt frames never move the bars. Does not affect the self-heal accounting below.
+                LINK_RSSI.signal(status.rssi);
                 got_reply = true;
               } else {
                 applog::log_println!("telemetry decode failed ({} bytes)", bytes.len());
@@ -324,10 +353,10 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
   }
 }
 
-/// OLED status task. Renders the truck's ground speed (km/h, from `SPEED`) + link/fix flags + a lap-timer line
-/// (whole seconds since the last reset) on a direct (non-shared) I2C bus. "Link up" is a real liveness check: a
-/// Telemetry reply decoded within `LINK_TIMEOUT`. The lap timer is an elapsed-since-reset stopwatch — richer lap
-/// detection is a future TODO; the button task's `LAP_RESET` re-bases the elapsed-time origin.
+/// OLED status task — the committed G1 "Stopwatch" layout: a big lap clock (SS.s) with the lap number, the live
+/// pan/tilt as signed degrees, the GPS satellite count (relayed from the truck), and LoRa signal bars. "Link up" is
+/// a real liveness check: a Telemetry reply decoded within `LINK_TIMEOUT`. The lap counter/stopwatch is owned here
+/// and re-based by the button's `LAP_EVENT` (short = next lap, long = reset to lap 1).
 #[embassy_executor::task]
 async fn oled_task(mut i2c: OledI2c) {
   // Probe 0x3C/0x3D first so a panel strapped to either address comes up (mirrors the lora-ping bring-up), and a
@@ -355,8 +384,14 @@ async fn oled_task(mut i2c: OledI2c) {
   // until a real reply arrives (Instant is monotonic, so duration_since never underflows). saturating_sub guards
   // the boot case where now < LINK_TIMEOUT.
   let mut last_rx = Instant::now().saturating_sub(LINK_TIMEOUT);
-  // Lap stopwatch origin: re-based to now on each LAP_RESET (or boot). The OLED shows elapsed-since-reset in
-  // whole seconds; richer lap detection is a future TODO.
+  // Last reply RSSI, floored so the bars read empty until a real reply lands (rssi_to_bars also zeroes when down).
+  let mut last_rssi: i16 = -127;
+  // Latest head pose (us), seeded to center so the degree readouts show 0/0 before the first PPM frame.
+  let mut pan_us: u32 = CENTER_US;
+  let mut tilt_us: u32 = CENTER_US;
+  // Lap state owned here: the button task only signals events. Lap numbering starts at 1; the stopwatch origin is
+  // re-based to now on each event (and at boot).
+  let mut lap: u32 = 1;
   let mut lap_origin = Instant::now();
 
   loop {
@@ -365,37 +400,69 @@ async fn oled_task(mut i2c: OledI2c) {
       last = telem;
       last_rx = Instant::now();
     }
-    if LAP_RESET.try_take().is_some() {
-      lap_origin = Instant::now();
+    if let Some((pan, tilt)) = HEAD.try_take() {
+      pan_us = pan;
+      tilt_us = tilt;
+    }
+    if let Some(rssi) = LINK_RSSI.try_take() {
+      last_rssi = rssi;
+    }
+    match LAP_EVENT.try_take() {
+      Some(LapEvent::Lap) => {
+        lap += 1;
+        lap_origin = Instant::now();
+      }
+      Some(LapEvent::Reset) => {
+        lap = 1;
+        lap_origin = Instant::now();
+      }
+      None => {}
     }
 
     // Real liveness, not a one-way latch: the link is up only while a reply has been seen within LINK_TIMEOUT, so
-    // the OLED falls back to LINK:N when the truck goes away instead of showing LINK:Y forever.
-    let link_up = Instant::now().duration_since(last_rx) < LINK_TIMEOUT;
-    let gps_fix = last.fix_quality != 0;
-    // Whole seconds since the last LAP_RESET (or boot). The display dirty-check skips the flush until this ticks
-    // over, so the panel only re-renders the lap line ~1 Hz while everything else is steady.
-    let lap_secs = Instant::now().duration_since(lap_origin).as_secs() as u32;
-    let status = display::Status { speed_cm_s: last.speed_cm_s, link_up, gps_fix, lap_secs };
-    if let Err(e) = oled.render(status).await {
+    // the bars fall to empty when the truck goes away instead of holding their last value forever.
+    let linked = Instant::now().duration_since(last_rx) < LINK_TIMEOUT;
+    let bars = display::rssi_to_bars(last_rssi, linked);
+    // Lap time in tenths since the origin. Instant is monotonic and the origin is always <= now, but use the
+    // saturating form to stay underflow-proof regardless.
+    let lap_tenths = (Instant::now().saturating_duration_since(lap_origin).as_millis() / 100) as u32;
+    let status = display::GoggleStatus {
+      lap,
+      lap_tenths,
+      pan_deg: display::pan_us_to_deg(pan_us as i32),
+      tilt_deg: display::tilt_us_to_deg(tilt_us as i32),
+      sats: last.sats,
+      bars,
+    };
+    if let Err(e) = oled.render_goggle(status).await {
       applog::log_println!("OLED render error: {:?}", e);
     }
   }
 }
 
-/// Lap-reset button task. The button is active-low with an internal pull-up, so a press is a falling edge; on each
-/// press it signals `LAP_RESET` for the OLED to re-base its placeholder lap timer. Full lap logic is a future TODO.
+/// Lap button task. The button is active-low with an internal pull-up, so a press is a falling edge. A short press
+/// signals `LapEvent::Lap` (advance the lap), a long press (held past `LONG_PRESS`) signals `LapEvent::Reset`. The
+/// OLED owns the lap counter/stopwatch and acts on the gesture.
 #[embassy_executor::task]
 async fn button_task(mut button: Input<'static>) {
   loop {
-    // Wait for the press edge (active-low -> falling), then sleep the debounce window and RE-CHECK the line is
-    // still low. A real press holds the line low past the window; a bounce/glitch has released by then and fires
-    // no reset. Only on a confirmed press do we signal LAP_RESET once, then wait for the rising edge (release)
-    // before re-arming — so one physical press = exactly one reset. TODO: tune the debounce window on hardware.
+    // Wait for the press edge (active-low -> falling), then sleep the debounce window and RE-CHECK the line is still
+    // low. A real press holds the line low past the window; a bounce/glitch has released by then and is ignored.
     button.wait_for_falling_edge().await;
     Timer::after(Duration::from_millis(50)).await;
-    if button.is_low() {
-      LAP_RESET.signal(());
+    if button.is_high() {
+      continue; // glitch, not a real press — re-arm.
+    }
+    // Confirmed press held low. Race the release (rising edge) against the long-press timer: released first =>
+    // short press (Lap); the timer wins => still held at the threshold => long press (Reset).
+    let event = match select(button.wait_for_rising_edge(), Timer::after(LONG_PRESS)).await {
+      Either::First(()) => LapEvent::Lap,
+      Either::Second(()) => LapEvent::Reset,
+    };
+    LAP_EVENT.signal(event);
+    // For a long press the release has NOT happened yet (the timer won the race), so drain it before re-arming so
+    // one physical press is exactly one event. A short press already consumed its release edge in the race above.
+    if event == LapEvent::Reset {
       button.wait_for_rising_edge().await;
     }
   }

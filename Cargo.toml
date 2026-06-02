@@ -9,7 +9,8 @@ members = [
   "crates/servo",        # LEDC servo PWM mapping
   "crates/imu",          # MPU-6050 home/center detection
   "crates/display",      # SSD1306 OLED status
-  "crates/gps",          # UART NMEA ground-speed reader (bonus)
+  "crates/gps",          # UART NMEA ground-speed + position reader (bonus)
+  "crates/geo",          # pure GPS nav math: deg×1e7 deltas -> distance + bearing to home
   "crates/nrf-spike",    # Phase A de-risk spike: SoftDevice + USB-CDC + 1 Hz blinky on nRF52840
   "crates/applog",       # shared USB-CDC logging + panic/defmt handler (Phase B)
   "crates/nrf-adapters",  # embassy-nrf -> embedded-hal adapters shared by ported crates (Phase B)
@@ -123,6 +124,7 @@ servo = { path = "crates/servo" }
 imu = { path = "crates/imu" }
 display = { path = "crates/display" }
 gps = { path = "crates/gps" }
+geo = { path = "crates/geo" }
 # Phase B crates created by the parallel agents next: applog (USB-CDC logging + panic/defmt handler) and
 # nrf-adapters (embassy-nrf -> embedded-hal adapters shared by the ported driver/node crates).
 applog = { path = "crates/applog" }

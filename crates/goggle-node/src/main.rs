@@ -11,11 +11,12 @@
 //!     encodes it with micropb, transmits, and listens briefly for the truck's `Telemetry` reply; on a decode
 //!     it signals the telemetry into `SPEED` (GPS sats for the OLED) and the reply RSSI into `LINK_RSSI`.
 //!   - `oled_task`   — `display::StatusDisplay` on a direct `Twim` (the SSD1306 is the only I2C device here, so
-//!     no shared bus). Renders the G1 layout: a big lap clock (SS.s) + lap number, live pan/tilt in degrees,
-//!     the GPS satellite count, and LoRa signal bars.
-//!   - `button_task` — `Input` on `pins.button` (active-low, internal pull-up); a short press signals
-//!     `LapEvent::Lap` (advance the lap), a long press (held past `LONG_PRESS`) signals `LapEvent::Reset` (back
-//!     to lap 1). The OLED owns the lap counter + stopwatch origin and re-bases them on each event.
+//!     no shared bus). Owns the screen state and cycles between two layouts: the G1 Stopwatch (lap clock +
+//!     pan/tilt + sats + bars) and the Nav "find my truck" screen (the truck's distance + bearing to its home,
+//!     relayed in the telemetry). A long press resets the lap on Stopwatch or requests a re-home on Nav.
+//!   - `button_task` — `Input` on `pins.button` (active-low, internal pull-up); classifies each press as
+//!     `Press::Short` (cycle screens) or `Press::Long` (the current screen's action) and signals it; the OLED
+//!     task interprets the gesture per the screen it is showing.
 //!
 //! Half-duplex turnaround (scaffold scheme, tunable on hardware): the goggle is the link master. It TXes a
 //! Control, then immediately listens for one Telemetry reply with a short bounded timeout before the next
@@ -118,6 +119,11 @@ const LONG_PRESS: Duration = Duration::from_millis(800);
 // of TX cycles' worth of slack so a single dropped reply does not flap the flag. TODO: tune on hardware.
 const LINK_TIMEOUT: Duration = Duration::from_millis(500);
 
+// How many consecutive Control transmits carry the re-home flag after a Nav-screen long press. The link is lossy
+// half-duplex, so a single flagged Control can be dropped; bursting it over ~10 * 40 ms = 0.4 s makes the truck
+// hear it reliably without latching the flag on permanently (which would re-home every fix).
+const REHOME_BURST: u8 = 10;
+
 // Latest pan/tilt command, published by the PPM reader and consumed by the LoRa task. CriticalSectionRawMutex
 // because the Signal is a `static` shared across tasks.
 static CONTROL: Signal<CriticalSectionRawMutex, Control> = Signal::new();
@@ -131,18 +137,30 @@ static HEAD: Signal<CriticalSectionRawMutex, (u32, u32)> = Signal::new();
 // RSSI (dBm) of the most recent binding-valid Telemetry reply, published by the LoRa task, consumed by the OLED to
 // derive the header signal bars. Published only on a decoded reply so noise/foreign frames never move the bars.
 static LINK_RSSI: Signal<CriticalSectionRawMutex, i16> = Signal::new();
-// Lap-timer gesture from the button: a short press marks a new lap, a long press resets to lap 1. The OLED owns the
-// lap counter + stopwatch origin and re-bases them on each event.
-static LAP_EVENT: Signal<CriticalSectionRawMutex, LapEvent> = Signal::new();
+// Raw button press from the button task: a short or a long press. The MEANING is decided by the OLED task per the
+// current screen (short = cycle screens; long = reset the lap on Stopwatch, or request a re-home on Nav), so the
+// button task stays screen-agnostic and only classifies the gesture.
+static BUTTON: Signal<CriticalSectionRawMutex, Press> = Signal::new();
+// Re-home request from the OLED task (a long press on the Nav screen) to the LoRa task, which then sets the Control
+// re-home flag on its next few transmits so the truck re-captures its home point. Unit payload — only the edge matters.
+static SET_HOME_REQ: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 // Latest LoRa link state (Connected/Tentative/Disconnected) published by the LoRa task on each change. Surfaced for
 // the status display; the OLED derives liveness from the reply timeout instead, but this stays published for logs.
 static LINK_STATE: Signal<CriticalSectionRawMutex, lora_link::LinkState> = Signal::new();
 
-/// Button gesture for the lap timer. `Copy`/`Send`, so it rides a `Signal` to the OLED task.
+/// A classified button gesture. `Copy`/`Send`, so it rides a `Signal` to the OLED task, which interprets it per
+/// the screen currently shown.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LapEvent {
-  Lap,   // short press: advance to the next lap and restart the stopwatch
-  Reset, // long press: return to lap 1 and restart the stopwatch
+enum Press {
+  Short, // quick tap: cycle to the next screen
+  Long,  // held past LONG_PRESS: the current screen's action (reset lap / re-home)
+}
+
+/// Which goggle screen is currently shown. The short press cycles between them; each owns its own render path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Screen {
+  Stopwatch, // G1: lap clock + pan/tilt (render_goggle)
+  Nav,       // "find my truck": distance + bearing to the truck's home (render_nav)
 }
 
 // The radio type lives in `nrf_adapters::lora` now (shared by both nodes + lora-ping so it can never drift); the
@@ -249,7 +267,8 @@ async fn ppm_task(mut ppm: Input<'static>) {
       // Fall back to center for an axis the frame did not carry, so a short frame never sends a stale/garbage us.
       let pan_us = frame.channel(PAN_CHANNEL).map(u32::from).unwrap_or(CENTER_US);
       let tilt_us = frame.channel(TILT_CHANNEL).map(u32::from).unwrap_or(CENTER_US);
-      CONTROL.signal(Control { pan_us, tilt_us });
+      // flags is 0 here — the re-home command bit is injected by the LoRa task, not the PPM path.
+      CONTROL.signal(Control { pan_us, tilt_us, flags: 0 });
       // Publish the OLED's own copy of the head pose (independent Signal, lossy — latest frame only).
       HEAD.signal((pan_us, tilt_us));
     }
@@ -264,8 +283,10 @@ async fn ppm_task(mut ppm: Input<'static>) {
 async fn lora_task(mut link: nrf_adapters::lora::Link) {
   let mut ticker = Ticker::every(TX_PERIOD);
   // Until the first PPM frame, send center so the truck has a defined pose.
-  let mut latest = Control { pan_us: CENTER_US, tilt_us: CENTER_US };
+  let mut latest = Control { pan_us: CENTER_US, tilt_us: CENTER_US, flags: 0 };
   let mut rx_buf = [0u8; lora_link::MAX_PAYLOAD as usize];
+  // Countdown of remaining re-home-flagged transmits; armed to REHOME_BURST by a Nav-screen long press.
+  let mut rehome_pending: u8 = 0;
   // Owns the self-heal: counts reply-misses, re-inits the radio at the threshold, then backs off while Disconnected.
   let mut health = lora_link::LinkHealth::new(REINIT_AFTER_MISSES, REINIT_BACKOFF_MISSES);
   // Last published link state, so we only signal LINK_STATE on a change rather than every 40 ms tick.
@@ -281,16 +302,28 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
       latest = control;
     }
 
-    // Encode the Control into a heapless Vec<u8, 12> (covers any two-uint32 message), then wrap it with the binding
-    // frame ([link_id][proto][crc16], +4 bytes) so the truck only accepts frames from our pair. micropb's
-    // container-heapless-0-9 implements PbWrite for exactly this heapless 0.9 Vec.
-    let mut enc = PbEncoder::new(heapless::Vec::<u8, 12>::new());
-    if latest.encode(&mut enc).is_err() {
+    // A Nav-screen long press arms a short burst of re-home-flagged transmits, so the truck re-captures its home
+    // even if some flagged frames are lost over the air. The burst counts down by SUCCESSFUL transmits (in the TX
+    // Ok branch below), not by loop ticks, so a run of TX errors/timeouts can't silently drain it without the
+    // truck ever hearing a flagged frame.
+    if SET_HOME_REQ.try_take().is_some() {
+      rehome_pending = REHOME_BURST;
+    }
+    let mut out = latest; // out.flags is 0 — both the PPM path and the initial value set flags: 0.
+    if rehome_pending > 0 {
+      out.flags = 1; // request re-home (bit0); counted against the burst only once this frame actually goes out.
+    }
+
+    // Encode the Control into a heapless Vec<u8, 24> (pan/tilt/flags worst-case to 18 B, plus headroom), then wrap
+    // it with the binding frame ([link_id][proto][crc16], +4 bytes) so the truck only accepts frames from our pair.
+    // micropb's container-heapless-0-9 implements PbWrite for exactly this heapless 0.9 Vec.
+    let mut enc = PbEncoder::new(heapless::Vec::<u8, 24>::new());
+    if out.encode(&mut enc).is_err() {
       applog::log_println!("control encode failed");
       continue;
     }
     let payload = enc.into_writer();
-    let mut framed = heapless::Vec::<u8, 16>::new();
+    let mut framed = heapless::Vec::<u8, 28>::new();
     if link_id::frame(&BINDING, &payload, &mut framed).is_err() {
       applog::log_println!("control frame overflow");
       continue;
@@ -303,6 +336,9 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
     // would otherwise hang the transmit loop forever. On error/timeout we fall through to the miss accounting below.
     match select(link.send(&framed, TX_POWER_DBM), Timer::after(TX_TIMEOUT)).await {
       Either::First(Ok(())) => {
+        // The Control (flagged or not) actually left the radio, so count a re-home frame against the burst HERE —
+        // never on a TX error/timeout — so the burst survives a link blip and is only spent by frames on the air.
+        rehome_pending = rehome_pending.saturating_sub(1);
         // Listen for the truck's Telemetry reply, bounded by REPLY_TIMEOUT so a lost reply cannot stall the loop.
         match select(link.receive_with_status(&mut rx_buf), Timer::after(REPLY_TIMEOUT)).await {
           Either::First(Ok((len, status))) => {
@@ -353,10 +389,12 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
   }
 }
 
-/// OLED status task — the committed G1 "Stopwatch" layout: a big lap clock (SS.s) with the lap number, the live
-/// pan/tilt as signed degrees, the GPS satellite count (relayed from the truck), and LoRa signal bars. "Link up" is
-/// a real liveness check: a Telemetry reply decoded within `LINK_TIMEOUT`. The lap counter/stopwatch is owned here
-/// and re-based by the button's `LAP_EVENT` (short = next lap, long = reset to lap 1).
+/// OLED status task. Owns the screen state and cycles two layouts with the button: the G1 "Stopwatch" (a big lap
+/// clock SS.s, live pan/tilt degrees, the relayed GPS sat count, LoRa bars) and the "Nav" find-my-truck screen
+/// (distance + bearing to the truck's home). A SHORT press (`Press::Short`) cycles screens; a LONG press
+/// (`Press::Long`) is the current screen's action — re-base the Stopwatch clock, or request a re-home on Nav.
+/// "Link up" is a real liveness check: a Telemetry reply decoded within `LINK_TIMEOUT`. Manual lap-advance was
+/// dropped when the button took over screen cycling, so the lap number is a fixed "01" placeholder for now.
 #[embassy_executor::task]
 async fn oled_task(mut i2c: OledI2c) {
   // Probe 0x3C/0x3D first so a panel strapped to either address comes up (mirrors the lora-ping bring-up), and a
@@ -389,10 +427,12 @@ async fn oled_task(mut i2c: OledI2c) {
   // Latest head pose (us), seeded to center so the degree readouts show 0/0 before the first PPM frame.
   let mut pan_us: u32 = CENTER_US;
   let mut tilt_us: u32 = CENTER_US;
-  // Lap state owned here: the button task only signals events. Lap numbering starts at 1; the stopwatch origin is
-  // re-based to now on each event (and at boot).
-  let mut lap: u32 = 1;
+  // Stopwatch state owned here: the button task only signals raw presses. With manual lap-advance dropped (the
+  // button now cycles screens), only the running clock is live — a long press re-bases its origin to now. The lap
+  // NUMBER has no advance trigger, so it is a fixed "01" placeholder passed straight into the render below.
   let mut lap_origin = Instant::now();
+  // Which screen the button is currently showing; the short press toggles it.
+  let mut screen = Screen::Stopwatch;
 
   loop {
     ticker.next().await;
@@ -407,15 +447,22 @@ async fn oled_task(mut i2c: OledI2c) {
     if let Some(rssi) = LINK_RSSI.try_take() {
       last_rssi = rssi;
     }
-    match LAP_EVENT.try_take() {
-      Some(LapEvent::Lap) => {
-        lap += 1;
-        lap_origin = Instant::now();
+    // Short press cycles screens; long press is the current screen's action — re-base the stopwatch on Stopwatch,
+    // request a re-home on Nav (the truck owns the home point, so we ask it over the link rather than acting locally).
+    match BUTTON.try_take() {
+      Some(Press::Short) => {
+        screen = match screen {
+          Screen::Stopwatch => Screen::Nav,
+          Screen::Nav => Screen::Stopwatch,
+        };
       }
-      Some(LapEvent::Reset) => {
-        lap = 1;
-        lap_origin = Instant::now();
-      }
+      Some(Press::Long) => match screen {
+        Screen::Stopwatch => lap_origin = Instant::now(),
+        Screen::Nav => {
+          SET_HOME_REQ.signal(());
+          applog::log_println!("re-home requested");
+        }
+      },
       None => {}
     }
 
@@ -423,26 +470,52 @@ async fn oled_task(mut i2c: OledI2c) {
     // the bars fall to empty when the truck goes away instead of holding their last value forever.
     let linked = Instant::now().duration_since(last_rx) < LINK_TIMEOUT;
     let bars = display::rssi_to_bars(last_rssi, linked);
-    // Lap time in tenths since the origin. Instant is monotonic and the origin is always <= now, but use the
-    // saturating form to stay underflow-proof regardless.
-    let lap_tenths = (Instant::now().saturating_duration_since(lap_origin).as_millis() / 100) as u32;
-    let status = display::GoggleStatus {
-      lap,
-      lap_tenths,
-      pan_deg: display::pan_us_to_deg(pan_us as i32),
-      tilt_deg: display::tilt_us_to_deg(tilt_us as i32),
-      sats: last.sats,
-      bars,
+
+    // Render the active screen. The Nav screen intentionally keeps showing the LAST known distance/bearing when the
+    // link drops (bars fall to empty) — for "find my truck", the final fix is exactly what you want.
+    let result = match screen {
+      Screen::Stopwatch => {
+        // Lap time in tenths since the origin. Instant is monotonic and the origin is always <= now, but use the
+        // saturating form to stay underflow-proof regardless.
+        let lap_tenths = (Instant::now().saturating_duration_since(lap_origin).as_millis() / 100) as u32;
+        oled
+          .render_goggle(display::GoggleStatus {
+            lap: 1, // fixed placeholder — no lap-advance trigger remains (see the task doc).
+            lap_tenths,
+            pan_deg: display::pan_us_to_deg(pan_us as i32),
+            tilt_deg: display::tilt_us_to_deg(tilt_us as i32),
+            sats: last.sats,
+            bars,
+          })
+          .await
+      }
+      Screen::Nav => {
+        // "At home" when the truck sits within GPS noise of home — there the bearing would spin, so the screen
+        // shows "AT HOME" instead. render_nav already gates the whole readout on nav_valid, so this need not
+        // re-check it. AT_HOME_M is shared with the truck's nav math. bearing_deg is folded mod 360 so an
+        // out-of-range value from a corrupt decode lands in a real sector instead of truncating via `as u16`.
+        let at_home = last.dist_m < geo::AT_HOME_M;
+        oled
+          .render_nav(display::NavStatus {
+            dist_m: last.dist_m,
+            bearing_deg: (last.bearing_deg % 360) as u16,
+            nav_valid: last.nav_valid,
+            at_home,
+            sats: last.sats,
+            bars,
+          })
+          .await
+      }
     };
-    if let Err(e) = oled.render_goggle(status).await {
+    if let Err(e) = result {
       applog::log_println!("OLED render error: {:?}", e);
     }
   }
 }
 
-/// Lap button task. The button is active-low with an internal pull-up, so a press is a falling edge. A short press
-/// signals `LapEvent::Lap` (advance the lap), a long press (held past `LONG_PRESS`) signals `LapEvent::Reset`. The
-/// OLED owns the lap counter/stopwatch and acts on the gesture.
+/// Button task. The button is active-low with an internal pull-up, so a press is a falling edge. It only
+/// classifies the gesture — a short press signals `Press::Short`, a long press (held past `LONG_PRESS`) signals
+/// `Press::Long` — and the OLED task decides what each means for the current screen.
 #[embassy_executor::task]
 async fn button_task(mut button: Input<'static>) {
   loop {
@@ -454,15 +527,15 @@ async fn button_task(mut button: Input<'static>) {
       continue; // glitch, not a real press — re-arm.
     }
     // Confirmed press held low. Race the release (rising edge) against the long-press timer: released first =>
-    // short press (Lap); the timer wins => still held at the threshold => long press (Reset).
-    let event = match select(button.wait_for_rising_edge(), Timer::after(LONG_PRESS)).await {
-      Either::First(()) => LapEvent::Lap,
-      Either::Second(()) => LapEvent::Reset,
+    // short press; the timer wins => still held at the threshold => long press.
+    let press = match select(button.wait_for_rising_edge(), Timer::after(LONG_PRESS)).await {
+      Either::First(()) => Press::Short,
+      Either::Second(()) => Press::Long,
     };
-    LAP_EVENT.signal(event);
+    BUTTON.signal(press);
     // For a long press the release has NOT happened yet (the timer won the race), so drain it before re-arming so
     // one physical press is exactly one event. A short press already consumed its release edge in the race above.
-    if event == LapEvent::Reset {
+    if press == Press::Long {
       button.wait_for_rising_edge().await;
     }
   }

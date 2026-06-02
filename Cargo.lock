@@ -830,6 +830,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "geo"
+version = "0.1.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -855,6 +862,7 @@ dependencies = [
  "embassy-nrf",
  "embassy-sync",
  "embassy-time",
+ "geo",
  "heapless 0.9.3",
  "link-id",
  "lora-link",
@@ -1887,6 +1895,7 @@ dependencies = [
  "embassy-sync",
  "embassy-time",
  "embedded-hal-async",
+ "geo",
  "gps",
  "heapless 0.9.3",
  "imu",

@@ -1,0 +1,11 @@
+[package]
+name = "geo"
+version.workspace = true
+edition.workspace = true
+
+# Pure GPS navigation math: integer deg×1e7 coordinate deltas -> distance (meters) + bearing (degrees) from a
+# home point, via an equirectangular small-angle approximation. no_std, no I/O, host-tested. The ONLY float
+# user here is libm (cosf/hypotf/atan2f/roundf), already a workspace dep, confined to the small-delta meter
+# conversion — the absolute-coordinate subtraction stays in integer i64 so f32 never differences large values.
+[dependencies]
+libm = { workspace = true }

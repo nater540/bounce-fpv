@@ -40,22 +40,28 @@ impl FixQuality {
 
 /// A decoded speed/fix snapshot. `speed_cm_s` is ground speed in centimeters per second (matches
 /// `Telemetry.speed_cm_s`). `satellites` and `fix` are populated when a GGA sentence supplied them since the
-/// last speed sentence; both are `None` if the receiver has not emitted GGA yet.
+/// last speed sentence; both are `None` if the receiver has not emitted GGA yet. `lat_e7`/`lon_e7` are the
+/// position in degrees × 1e7 (+N/+E), `None` until a sentence carried coordinates. They are reported as-parsed
+/// regardless of fix quality, so consumers MUST gate on `fix` before trusting them — 0,0 is a valid point.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct GpsFix {
   pub speed_cm_s: u32,
   pub satellites: Option<u8>,
   pub fix: Option<FixQuality>,
+  pub lat_e7: Option<i32>,
+  pub lon_e7: Option<i32>,
 }
 
-/// What a single parsed NMEA line yielded. RMC/VTG carry speed; GGA carries satellites + fix quality; other
-/// (or checksum-failed, or fieldwise-empty) sentences yield `None`.
+/// What a single parsed NMEA line yielded. RMC carries speed AND (when its status is 'A') position; VTG carries
+/// speed only; GGA carries satellites + fix quality + position. Other (or checksum-failed, or fieldwise-empty)
+/// sentences yield `None`. Coordinates ride alongside the sentence that carried them — RMC returns them on the
+/// same Speed value that triggers a fix, so position and speed stay atomic instead of lagging a cache.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Parsed {
-  /// Ground speed over ground, already converted to centimeters per second.
-  Speed(u32),
-  /// Fix status from GGA: satellite count and fix quality.
-  Status { satellites: Option<u8>, fix: FixQuality },
+  /// Ground speed (cm/s), plus the sentence's own coordinates when it carried valid ones (RMC; `None` for VTG).
+  Speed { speed_cm_s: u32, lat_e7: Option<i32>, lon_e7: Option<i32> },
+  /// Fix status from GGA: satellite count, fix quality, and the GGA position when present.
+  Status { satellites: Option<u8>, fix: FixQuality, lat_e7: Option<i32>, lon_e7: Option<i32> },
   /// A valid sentence we do not extract anything from, or a sentence with the relevant field empty.
   None,
 }
@@ -127,18 +133,26 @@ pub fn parse_line(line: &[u8]) -> Parsed {
   let kind = &addr[addr.len() - 3..];
 
   if kind == b"RMC" {
-    // RMC field 7 (0-based, where field 0 is the address) is speed over ground in knots.
-    match field(body, 7).and_then(parse_decimal_milli) {
-      Some(milliknots) => Parsed::Speed(milliknots_to_cm_s(milliknots)),
-      None => Parsed::None,
-    }
+    // RMC field 7 (0-based, where field 0 is the address) is speed over ground in knots; without it there is
+    // no fix to return. Position rides fields 3/4 (lat, N/S) and 5/6 (lon, E/W), but ONLY when field 2 (status)
+    // is 'A' (active); 'V' (void) carries a stale/garbage position before a real fix.
+    let Some(milliknots) = field(body, 7).and_then(parse_decimal_milli) else {
+      return Parsed::None;
+    };
+    let (lat_e7, lon_e7) = if matches!(field(body, 2), Some(b"A")) {
+      (coord(body, 3, 4), coord(body, 5, 6))
+    } else {
+      (None, None)
+    };
+    Parsed::Speed { speed_cm_s: milliknots_to_cm_s(milliknots), lat_e7, lon_e7 }
   } else if kind == b"VTG" {
     // VTG field 7 is speed over ground in km/h; field 5 is the same speed in knots. Some receivers populate
-    // only knots, so fall back to field 5 (via milliknots_to_cm_s) when field 7 is empty/absent.
+    // only knots, so fall back to field 5 (via milliknots_to_cm_s) when field 7 is empty/absent. VTG carries
+    // no position, so its coordinates are always `None`.
     match field(body, 7).and_then(parse_decimal_milli) {
-      Some(milli_kmh) => Parsed::Speed(milli_kmh_to_cm_s(milli_kmh)),
+      Some(milli_kmh) => Parsed::Speed { speed_cm_s: milli_kmh_to_cm_s(milli_kmh), lat_e7: None, lon_e7: None },
       None => match field(body, 5).and_then(parse_decimal_milli) {
-        Some(milliknots) => Parsed::Speed(milliknots_to_cm_s(milliknots)),
+        Some(milliknots) => Parsed::Speed { speed_cm_s: milliknots_to_cm_s(milliknots), lat_e7: None, lon_e7: None },
         None => Parsed::None,
       },
     }
@@ -147,8 +161,15 @@ pub fn parse_line(line: &[u8]) -> Parsed {
     // arbitrary digit counts, so saturate to u8::MAX instead of `as u8` truncating (300 -> 44, 256 -> 0).
     let fix = field(body, 6).and_then(parse_uint).map(|q| FixQuality { raw: q.min(u8::MAX as u32) as u8 });
     let sats = field(body, 7).and_then(parse_uint).map(|n| n.min(u8::MAX as u32) as u8);
+    // Position rides fields 2/3 (lat, N/S) and 4/5 (lon, E/W), but ONLY when the fix is usable (quality != 0).
+    // A no-fix GGA can still carry empty or last-known lat/lon; surfacing those would seed the position cache
+    // with a stale point that a later void RMC's cache fallback would then resurface as a "live" position.
+    let (lat_e7, lon_e7) = match fix {
+      Some(f) if f.has_fix() => (coord(body, 2, 3), coord(body, 4, 5)),
+      _ => (None, None),
+    };
     match fix {
-      Some(fix) => Parsed::Status { satellites: sats, fix },
+      Some(fix) => Parsed::Status { satellites: sats, fix, lat_e7, lon_e7 },
       None => Parsed::None,
     }
   } else {
@@ -167,6 +188,91 @@ fn field(body: &[u8], index: usize) -> Option<&[u8]> {
     i += 1;
   }
   None
+}
+
+/// Reads a coordinate from a value field (`value_index`, the `ddmm.mmmm`) and its adjacent hemisphere field
+/// (`hemi_index`, one of N/S/E/W), returning degrees × 1e7 or `None` when either field is absent/malformed.
+fn coord(body: &[u8], value_index: usize, hemi_index: usize) -> Option<i32> {
+  match (field(body, value_index), field(body, hemi_index)) {
+    (Some(value), Some(hemi)) => parse_coord_e7(value, hemi),
+    _ => None,
+  }
+}
+
+/// Folds a run of ASCII digits into an i64, returning `None` on any non-digit byte (an empty slice yields 0).
+/// Shared by the degree and whole-minute fields of [`parse_coord_e7`] so the accumulation idiom lives once.
+fn fold_digits_i64(bytes: &[u8]) -> Option<i64> {
+  let mut v: i64 = 0;
+  for &b in bytes {
+    if !b.is_ascii_digit() {
+      return None;
+    }
+    v = v * 10 + (b - b'0') as i64;
+  }
+  Some(v)
+}
+
+/// Parses an NMEA latitude/longitude magnitude (`ddmm.mmmm` / `dddmm.mmmm`) plus its hemisphere byte into
+/// degrees × 1e7 (i32, +N/+E). The degree/minute split is positional — the two integer digits left of the
+/// decimal point are whole minutes, everything to their left is degrees — so one code path handles 2-digit
+/// latitude and 3-digit longitude (and rejects a longitude mis-fed as latitude, whose surplus digit pushes
+/// minutes past 60). All scaling is integer i64, rounded to nearest. The hemisphere byte sets BOTH the sign and
+/// the valid range (latitude <= 90°, longitude <= 180°), so a corrupt over-range magnitude is rejected per-axis.
+/// Returns `None` on any malformed field: a non-digit byte, fewer than four integer digits, minutes >= 60, an
+/// out-of-range result, or a missing/unknown hemisphere. Deliberately NOT built on `parse_decimal_milli`, which
+/// caps at three fractional digits and would coarsen a coordinate to a couple meters of minute resolution.
+fn parse_coord_e7(value: &[u8], hemi: &[u8]) -> Option<i32> {
+  // Split the integer part from the optional fractional minutes at the decimal point.
+  let dot = value.iter().position(|&b| b == b'.').unwrap_or(value.len());
+  let int_part = &value[..dot];
+  let frac_part = value.get(dot + 1..).unwrap_or(&[]);
+  // Need at least dd + mm: two degree-or-more digits plus the two whole-minute digits.
+  if int_part.len() < 4 {
+    return None;
+  }
+  let (deg_bytes, min_bytes) = int_part.split_at(int_part.len() - 2);
+
+  // Degrees (any number of leading digits) and whole minutes (exactly the two digits left of the point).
+  let deg = fold_digits_i64(deg_bytes)?;
+  let min_whole = fold_digits_i64(min_bytes)?;
+  if min_whole >= 60 {
+    return None;
+  }
+  // Fractional minutes scaled to exactly five digits (1e-5 minute ~= 1.85 cm — far finer than needed): read at
+  // most five, ignore any beyond, and right-pad a short field.
+  let mut frac: i64 = 0;
+  let mut digits = 0;
+  for &b in frac_part {
+    if !b.is_ascii_digit() {
+      return None;
+    }
+    if digits < 5 {
+      frac = frac * 10 + (b - b'0') as i64;
+      digits += 1;
+    }
+  }
+  while digits < 5 {
+    frac *= 10;
+    digits += 1;
+  }
+  // min_scaled is minutes in units of 1e-5 minute (0..5_999_999); deg_e7 = deg*1e7 + round(min_scaled*1e7 /
+  // (60*1e5)). The +half-divisor rounds to nearest, matching the speed converters. All in i64 (the numerator
+  // peaks near 6e13).
+  let min_scaled = min_whole * 100_000 + frac;
+  let deg_e7 = deg * 10_000_000 + (min_scaled * 10_000_000 + 3_000_000) / 6_000_000;
+  // Hemisphere sets the sign AND the per-axis range bound: latitude (N/S) caps at 90°, longitude (E/W) at 180°.
+  // A missing/unknown hemisphere, or a magnitude beyond the axis bound (e.g. a corrupt 91° latitude), is rejected.
+  let (sign, limit): (i32, i64) = match hemi.first() {
+    Some(b'N') => (1, 900_000_000),
+    Some(b'S') => (-1, 900_000_000),
+    Some(b'E') => (1, 1_800_000_000),
+    Some(b'W') => (-1, 1_800_000_000),
+    _ => return None,
+  };
+  if deg_e7 > limit {
+    return None;
+  }
+  Some(sign * deg_e7 as i32)
 }
 
 /// Parses an unsigned-decimal ASCII field like `12.34` into milli-units (value * 1000), integer-only. Reads
@@ -244,15 +350,29 @@ pub struct GpsReader<R> {
   // overwritten by a fresh read.
   chunk_len: usize,
   chunk_pos: usize,
-  // Latest fix status seen since the last returned speed; folded into the next `GpsFix`.
+  // Latest fix status + position seen since the last returned speed; folded into the next `GpsFix`. The
+  // coordinate cache is a fallback for VTG-speed receivers (whose Speed sentence carries no position); an RMC
+  // return uses its OWN coordinates and never reaches the cache, so position stays atomic with the speed.
   last_sats: Option<u8>,
   last_fix: Option<FixQuality>,
+  last_lat_e7: Option<i32>,
+  last_lon_e7: Option<i32>,
 }
 
 impl<R: Read> GpsReader<R> {
   /// Wraps a UART that yields the receiver's NMEA byte stream. The reader only consumes RX; nothing is sent.
   pub fn new(uart: R) -> Self {
-    Self { uart, line: Vec::new(), chunk: [0; READ_CHUNK], chunk_len: 0, chunk_pos: 0, last_sats: None, last_fix: None }
+    Self {
+      uart,
+      line: Vec::new(),
+      chunk: [0; READ_CHUNK],
+      chunk_len: 0,
+      chunk_pos: 0,
+      last_sats: None,
+      last_fix: None,
+      last_lat_e7: None,
+      last_lon_e7: None,
+    }
   }
 
   /// Reads from the UART until a speed sentence (RMC or VTG) completes, returning a [`GpsFix`] with the
@@ -278,13 +398,19 @@ impl<R: Read> GpsReader<R> {
             let parsed = parse_line(&self.line);
             self.line.clear();
             match parsed {
-              Parsed::Speed(speed_cm_s) => {
-                // `chunk_pos` already points past this terminator, so the next call resumes mid-chunk.
-                return Ok(GpsFix { speed_cm_s, satellites: self.last_sats, fix: self.last_fix });
+              Parsed::Speed { speed_cm_s, lat_e7, lon_e7 } => {
+                // Prefer this sentence's OWN coordinates (RMC carries them atomically with the speed return);
+                // fall back to the last GGA-cached position so a VTG-speed receiver still reports a (one-fix-
+                // old) location. `chunk_pos` already points past this terminator, so the next call resumes mid-chunk.
+                let lat_e7 = lat_e7.or(self.last_lat_e7);
+                let lon_e7 = lon_e7.or(self.last_lon_e7);
+                return Ok(GpsFix { speed_cm_s, satellites: self.last_sats, fix: self.last_fix, lat_e7, lon_e7 });
               }
-              Parsed::Status { satellites, fix } => {
+              Parsed::Status { satellites, fix, lat_e7, lon_e7 } => {
                 self.last_sats = satellites;
                 self.last_fix = Some(fix);
+                self.last_lat_e7 = lat_e7;
+                self.last_lon_e7 = lon_e7;
               }
               Parsed::None => {}
             }
@@ -307,7 +433,12 @@ mod tests {
     // Standard GPRMC; field 7 (speed) = 22.4 knots. 22.4 kn * 51.4444 = 1152.35 cm/s -> 1152.
     let line = b"$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
     match parse_line(line) {
-      Parsed::Speed(cm_s) => assert_eq!(cm_s, milliknots_to_cm_s(22_400)),
+      Parsed::Speed { speed_cm_s, lat_e7, lon_e7 } => {
+        assert_eq!(speed_cm_s, milliknots_to_cm_s(22_400));
+        // RMC status is 'A', so it carries its own position alongside the speed (48° 07.038' N, 11° 31.000' E).
+        assert_eq!(lat_e7, Some(481_173_000));
+        assert_eq!(lon_e7, Some(115_166_667));
+      }
       other => panic!("expected Speed, got {:?}", other),
     }
     assert_eq!(milliknots_to_cm_s(22_400), 1152);
@@ -326,7 +457,10 @@ mod tests {
     line.push(hex[(cksum >> 4) as usize]).unwrap();
     line.push(hex[(cksum & 0xF) as usize]).unwrap();
     match parse_line(&line) {
-      Parsed::Speed(cm_s) => assert_eq!(cm_s, milli_kmh_to_cm_s(10_000)),
+      Parsed::Speed { speed_cm_s, lat_e7, lon_e7 } => {
+        assert_eq!(speed_cm_s, milli_kmh_to_cm_s(10_000));
+        assert_eq!((lat_e7, lon_e7), (None, None)); //  VTG carries no position.
+      }
       other => panic!("expected Speed, got {:?}", other),
     }
     assert_eq!(milli_kmh_to_cm_s(10_000), 278); //  10 km/h = 277.78 cm/s, rounded.
@@ -342,12 +476,74 @@ mod tests {
   fn gga_yields_fix_status() {
     let line = b"$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47";
     match parse_line(line) {
-      Parsed::Status { satellites, fix } => {
+      Parsed::Status { satellites, fix, lat_e7, lon_e7 } => {
         assert_eq!(satellites, Some(8));
         assert!(fix.has_fix());
         assert_eq!(fix.raw, 1);
+        assert_eq!(lat_e7, Some(481_173_000)); //  48° 07.038' N.
+        assert_eq!(lon_e7, Some(115_166_667)); //  11° 31.000' E.
       }
       other => panic!("expected Status, got {:?}", other),
+    }
+  }
+
+  #[test]
+  fn southern_western_hemispheres_negate() {
+    // Same magnitudes as the canonical fixture, but S/W must flip the sign.
+    assert_eq!(parse_coord_e7(b"4807.038", b"S"), Some(-481_173_000));
+    assert_eq!(parse_coord_e7(b"01131.000", b"W"), Some(-115_166_667));
+  }
+
+  #[test]
+  fn longitude_three_degree_digits_and_range_bound() {
+    // Longitude has three degree digits; the positional split must still take the last two as whole minutes.
+    assert_eq!(parse_coord_e7(b"01131.000", b"E"), Some(115_166_667));
+    // 180° 00.000' is the longitude upper bound (valid); past it the result is rejected rather than overflowing.
+    assert_eq!(parse_coord_e7(b"18000.000", b"E"), Some(1_800_000_000));
+    assert_eq!(parse_coord_e7(b"18100.000", b"E"), None);
+  }
+
+  #[test]
+  fn latitude_bounded_to_90_degrees() {
+    // Latitude caps at 90° (a tighter bound than longitude's 180°): 90°00.000' is valid, 90°01' is rejected as
+    // an impossible/corrupt coordinate rather than passing the generic 180° check.
+    assert_eq!(parse_coord_e7(b"9000.000", b"N"), Some(900_000_000));
+    assert_eq!(parse_coord_e7(b"9001.000", b"N"), None);
+    assert_eq!(parse_coord_e7(b"9000.000", b"S"), Some(-900_000_000));
+  }
+
+  #[test]
+  fn malformed_coords_rejected() {
+    assert_eq!(parse_coord_e7(b"4860.000", b"N"), None); //  minutes >= 60.
+    assert_eq!(parse_coord_e7(b"4807.038", b""), None); //  missing hemisphere.
+    assert_eq!(parse_coord_e7(b"4807.038", b"X"), None); //  unknown hemisphere.
+    assert_eq!(parse_coord_e7(b"480.0", b"N"), None); //  fewer than four integer digits.
+    assert_eq!(parse_coord_e7(b"48a7.038", b"N"), None); //  non-digit byte.
+  }
+
+  #[test]
+  fn gga_before_fix_has_no_coords() {
+    // Quality 0, empty lat/lon fields — a fix-status update with no position. Status returns, coords are None.
+    let body: &[u8] = b"GPGGA,123519,,,,,0,00,,,,,,,";
+    let line = framed(body);
+    match parse_line(&line) {
+      Parsed::Status { fix, lat_e7, lon_e7, .. } => {
+        assert!(!fix.has_fix());
+        assert_eq!((lat_e7, lon_e7), (None, None));
+      }
+      other => panic!("expected Status, got {:?}", other),
+    }
+  }
+
+  #[test]
+  fn rmc_void_status_drops_position() {
+    // A void ('V') RMC may still carry coordinate digits, but they are unreliable before a fix — drop them while
+    // still returning the (zero) speed so the reader does not stall.
+    let body: &[u8] = b"GPRMC,123519,V,4807.038,N,01131.000,E,000.0,084.4,230394,003.1,W";
+    let line = framed(body);
+    match parse_line(&line) {
+      Parsed::Speed { lat_e7, lon_e7, .. } => assert_eq!((lat_e7, lon_e7), (None, None)),
+      other => panic!("expected Speed, got {:?}", other),
     }
   }
 
@@ -365,9 +561,9 @@ mod tests {
     let body: &[u8] = b"GPRMC,123519,A,4807.038,N,01131.000,E,4000000.0,084.4,230394,003.1,W";
     let line = framed(body);
     match parse_line(&line) {
-      Parsed::Speed(cm_s) => {
-        assert_eq!(cm_s, MAX_SPEED_CM_S);
-        assert!(cm_s.checked_mul(36).is_some()); //  the downstream km/h math stays within u32.
+      Parsed::Speed { speed_cm_s, .. } => {
+        assert_eq!(speed_cm_s, MAX_SPEED_CM_S);
+        assert!(speed_cm_s.checked_mul(36).is_some()); //  the downstream km/h math stays within u32.
       }
       other => panic!("expected clamped Speed, got {:?}", other),
     }
@@ -379,7 +575,7 @@ mod tests {
     let body: &[u8] = b"GPGGA,123519,4807.038,N,01131.000,E,300,300,0.9,545.4,M,46.9,M,,";
     let line = framed(body);
     match parse_line(&line) {
-      Parsed::Status { satellites, fix } => {
+      Parsed::Status { satellites, fix, .. } => {
         assert_eq!(satellites, Some(u8::MAX));
         assert_eq!(fix.raw, u8::MAX);
         assert!(fix.has_fix());
@@ -394,7 +590,7 @@ mod tests {
     let body: &[u8] = b"GPVTG,054.7,T,034.4,M,005.5,N,,K";
     let line = framed(body);
     match parse_line(&line) {
-      Parsed::Speed(cm_s) => assert_eq!(cm_s, milliknots_to_cm_s(5_500)),
+      Parsed::Speed { speed_cm_s, .. } => assert_eq!(speed_cm_s, milliknots_to_cm_s(5_500)),
       other => panic!("expected Speed from knots fallback, got {:?}", other),
     }
   }
@@ -453,16 +649,22 @@ $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47\r\n\
 $GPVTG,054.7,T,034.4,M,005.5,N,010.0,K*4A\r\n";
     let mut reader = GpsReader::new(ScriptReader { data: SCRIPT, pos: 0 });
 
-    // First fix is the RMC speed. The GGA had not been parsed yet, so sats/fix are still None here.
+    // First fix is the RMC speed. The GGA had not been parsed yet, so sats/fix are still None here — but the
+    // RMC carries its OWN position (status 'A'), so the location is present and atomic with the speed.
     let first = block_on(reader.next_fix()).unwrap();
     assert_eq!(first.speed_cm_s, milliknots_to_cm_s(22_400));
+    assert_eq!(first.satellites, None);
+    assert_eq!(first.lat_e7, Some(481_173_000));
 
-    // Second fix resumes from the buffered tail: the GGA is parsed (updating cached status) and the trailing
-    // VTG returns its speed — now carrying the satellites/fix the GGA supplied, proving the GGA was not lost.
+    // Second fix resumes from the buffered tail: the GGA is parsed (updating cached status + position) and the
+    // trailing VTG returns its speed — now carrying the satellites/fix AND the cached position the GGA supplied,
+    // proving the GGA was not lost (the VTG itself has no coordinates).
     let second = block_on(reader.next_fix()).unwrap();
     assert_eq!(second.speed_cm_s, milli_kmh_to_cm_s(10_000));
     assert_eq!(second.satellites, Some(8));
     assert_eq!(second.fix.map(|f| f.raw), Some(1));
+    assert_eq!(second.lat_e7, Some(481_173_000));
+    assert_eq!(second.lon_e7, Some(115_166_667));
   }
 
   /// Builds a `$<body>*HH\r\n` framed NMEA line with a correct checksum, into a heapless buffer.

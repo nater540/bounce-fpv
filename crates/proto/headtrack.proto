@@ -1,9 +1,11 @@
 syntax = "proto3";
 
 // Bidirectional (half-duplex) LoRa wire format for the FPV head-tracking system. Two directions, two messages:
-//   Control   (goggle node -> truck node): pan/tilt head-tracking command.
-//   Telemetry (truck node  -> goggle node): GPS-derived ground-speed status.
-// Scalar-only fields. Keep both messages tiny to hold LoRa air-time low.
+//   Control   (goggle node -> truck node): pan/tilt head-tracking command + a small command flags word.
+//   Telemetry (truck node  -> goggle node): GPS-derived ground-speed status + distance/bearing to home.
+// Scalar-only, all-unsigned fields (no signed/float types on the wire): the truck computes the nav from its
+// internal signed deg×1e7 coordinates and ships only the non-negative distance/bearing. Keep both messages tiny
+// to hold LoRa air-time low.
 package headtrack;
 
 // Pan/tilt head-tracking command sent goggle -> truck. Carries the raw PPM pulse width in microseconds for each axis
@@ -13,11 +15,16 @@ package headtrack;
 message Control {
   uint32 pan_us = 1;   // pan PPM pulse width, microseconds (~1000-2000)
   uint32 tilt_us = 2;  // tilt PPM pulse width, microseconds (~1000-2000)
+  uint32 flags = 3;    // command bits; bit0 = request re-home (truck re-captures home at its next valid fix). 0 = none.
 }
 
-// GPS-derived telemetry sent truck -> goggle. Integers only — no floats on the wire.
+// GPS-derived telemetry sent truck -> goggle. Integers only — no floats on the wire. dist_m/bearing_deg are computed
+// truck-side (it owns the home point) so the goggle only displays them; both are valid only when nav_valid is true.
 message Telemetry {
   uint32 speed_cm_s = 1;    // ground speed, centimeters/second (unit shared with the `gps` crate — keep exactly this)
   uint32 sats = 2;          // satellites in the current fix
   uint32 fix_quality = 3;   // fix quality, 0 = no fix
+  uint32 dist_m = 4;        // distance home -> truck, whole meters (valid only when nav_valid)
+  uint32 bearing_deg = 5;   // bearing  home -> truck, 0..359 degrees, 0 = North (valid only when nav_valid)
+  bool nav_valid = 6;       // true when home is captured AND the current fix is valid; gates dist_m/bearing_deg
 }

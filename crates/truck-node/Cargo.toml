@@ -17,6 +17,8 @@ lora-link = { workspace = true }
 link-id = { workspace = true }
 imu = { workspace = true }
 gps = { workspace = true }
+# Pure nav math: the truck owns the home point, so it computes distance + bearing here and ships only those.
+geo = { workspace = true }
 applog = { workspace = true }
 nrf-adapters = { workspace = true }
 # Status OLED on the truck's I2C bus: shows the received pan/tilt + link liveness so head tracking is visible even

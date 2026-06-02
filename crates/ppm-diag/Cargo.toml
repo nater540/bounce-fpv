@@ -4,18 +4,29 @@ version.workspace = true
 edition.workspace = true
 
 # Phase 0 diagnostic binary (Phase C: nRF52840). Decodes the Skyzone PPM frame with the shared ppm-decoder crate
-# and prints per-channel pulse widths + channel count over the Nice!Nano's USB Serial/JTAG via applog. Build/run
-# this first to confirm channel count, pulse-width range, sync-gap length, and pan/tilt indices.
-# Optional inverted-PPM path. Enable only when an INVERTING buffer (e.g. 74LVC1G14) sits ahead of the PPM pin,
-# flipping the line to idle-high with falling-edge pulses. Default OFF matches the bare series-resistor wiring.
+# and reports per-channel pulse widths + channel count both over USB Serial/JTAG (applog) AND on the SSD1306 OLED
+# (so it can be watched while moving the head, no serial tether). Build/run this first to confirm channel count,
+# pulse-width range, sync-gap length, and pan/tilt indices.
+# PPM polarity. DEFAULT is idle-HIGH / falling-edge — the SKY04X HT output (tip = PPM, rests ~5 V, dips low for each
+# marker; the jack is PPM+GND only, no power pin). Enable `idle-low-ppm` for an idle-LOW / rising-edge signal instead.
 [features]
 default = []
-inverted-ppm = []
+idle-low-ppm = []
 
 [dependencies]
 board = { workspace = true }
 applog = { workspace = true }
 ppm-decoder = { workspace = true }
+# OLED mirror of the decode so the diagnostic needs no serial tether: the latest frame's channel count / sync gap /
+# corrupt flag / pan+tilt go to the SSD1306 from a SEPARATE task (the slow I2C flush must never block the edge loop),
+# fed by an embassy-sync Signal. heapless backs the on-panel formatting; static_cell holds the Twim tx buffer 'static.
+display = { workspace = true }
+embassy-sync = { workspace = true }
+# select(edge, timeout): when the line is silent the loop still wakes every ~0.5 s to sample the idle level, so a
+# dead line reports HIGH (on the +5 V tip / inverted) vs LOW (no signal) on the panel instead of a bare "waiting".
+embassy-futures = { workspace = true }
+heapless = { workspace = true }
+static_cell = { workspace = true }
 
 embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
 embassy-nrf = { workspace = true }

@@ -60,16 +60,31 @@ const TILT_CHANNEL: usize = 5;
 // Default pulse width signalled until a real PPM frame arrives, so the truck centers rather than slamming a stop.
 const CENTER_US: u32 = 1_500;
 
-// LoRa TX cadence: ~50 Hz head-tracking update. One Control goes out per tick, then we listen for the reply.
-const TX_PERIOD: Duration = Duration::from_millis(20);
+// LoRa TX cadence: one Control out per tick, then listen for the reply. Sized to the measured SF7/BW500 airtime:
+// a ~12-byte packet is ~10 ms on air, so a full Control-out + Telemetry-back cycle is send (~10 ms) + reply wait
+// (REPLY_TIMEOUT). 40 ms (~25 Hz) covers that with headroom — still ample for head tracking, and the radio's air
+// time caps the practical round-trip rate near here anyway. TODO: tighten once the on-hardware RTT is measured.
+const TX_PERIOD: Duration = Duration::from_millis(40);
 
-// How long to wait for the truck's Telemetry reply before giving up this cycle and moving on. Kept short so a
-// missed reply never stalls the head-tracking TX rate. TODO: tune on hardware against measured round-trip time.
-const REPLY_TIMEOUT: Duration = Duration::from_millis(12);
+// Upper bound on a single transmit. `send()` blocks on the DIO0 TX-done IRQ; if that IRQ is ever missed (e.g. GPIOTE
+// sense contention between the high-rate PPM edge waits and DIO0 on this node), the unbounded await would hang the
+// whole TX loop permanently — the "link dies after ~70 s, only a goggle reboot recovers" symptom. Bounding it lets the
+// loop re-prepare the radio next cycle and self-heal. 30 ms is ~3x the ~10 ms SF7/BW500 airtime, so a normal TX never
+// trips it. TODO: the deeper fix is isolating PPM from DIO0 (a dedicated GPIOTE channel or an InterruptExecutor).
+const TX_TIMEOUT: Duration = Duration::from_millis(30);
 
-// TX power in dBm passed to lora-phy's prepare_for_tx. 17 dBm is a safe RFM95W PA_BOOST default (tx_boost is
-// enabled in the radio build below). TODO: tune on hardware / per regional limits.
-const TX_POWER_DBM: i32 = 17;
+// How long to wait for the truck's Telemetry reply before giving up this cycle. This MUST exceed one reply's flight:
+// the truck only finishes receiving our Control when our TX ends, then turns around and sends ~10+ ms of telemetry,
+// so the reply lands ~15-17 ms into this window. The old 12 ms was shorter than a single packet's airtime and missed
+// every reply (the LINK:N symptom). 30 ms gives ~2x margin. TODO: tune down once the real RTT is measured.
+const REPLY_TIMEOUT: Duration = Duration::from_millis(30);
+
+// TX power in dBm passed to lora-phy's prepare_for_tx. Dropped from 17 to 10 dBm: at 17 dBm on the RFM95W's PA_BOOST,
+// sustained ~25 %-duty transmitting trips the PA's over-current/thermal protection after ~a minute — TX-done still
+// fires but NO RF radiates, so the truck goes silent and the link dies until a reboot (the observed failure). The
+// bench link sits at ~-41 dBm RSSI (~30 dB of margin), so 10 dBm is plenty and keeps the PA well under its limit.
+// TODO: raise toward 14-17 dBm only with a proper antenna + heatsinking and once real range needs it.
+const TX_POWER_DBM: i32 = 10;
 
 // PA output routing. The bare RFM95W bonds ONLY its PA_BOOST pin to the antenna, so tx_boost MUST be true or the
 // radiated power is near-zero and the link silently fails to come up (see lora-ping for the full rationale).
@@ -118,8 +133,10 @@ async fn main(spawner: Spawner) {
   applog::log_println!("");
   applog::log_println!("=== goggle-node: PPM -> LoRa TX, Telemetry RX -> OLED (nRF52840) ===");
 
-  // PPM line idles low and pulses high (matches ppm-diag): pull-down keeps it defined when unplugged, and the
-  // rising edge marks each channel position.
+  // PPM line from the SKY04X HT jack: it idles HIGH (~5 V on the tip; the jack is PPM+GND only, NO power pin) with
+  // brief LOW markers, so the FALLING edge marks each channel position. Pull::Down keeps the line defined LOW when the
+  // goggle is unplugged and helps the markers cross the threshold; the series protection resistor clamps the 5 V swing
+  // (the nRF is NOT 5 V tolerant). Confirmed on hardware via `ppm-diag` (the idle-high/falling build).
   let ppm = Input::new(pins.ppm, Pull::Down);
 
   // Lap-reset button: active-low to GND with an internal pull-up, so the line idles high and a press drives it low
@@ -154,7 +171,12 @@ async fn main(spawner: Spawner) {
   // bytes is ample for the small command bytes the driver sends (ssd1306 flushes its framebuffer from its own RAM).
   static TWIM_TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
   let tx_buf = TWIM_TX_BUF.init([0; 16]);
-  let oled_i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, twim::Config::default(), tx_buf);
+  // Enable the internal SDA/SCL pull-ups (Config::default enables NEITHER): the OLED bus needs them on bare wiring,
+  // the same fix that brought the panel up in lora-ping. Both flags set — embassy-nrf gates both lines off sda_pullup.
+  let mut oled_i2c_cfg = twim::Config::default();
+  oled_i2c_cfg.sda_pullup = true;
+  oled_i2c_cfg.scl_pullup = true;
+  let oled_i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, oled_i2c_cfg, tx_buf);
 
   // The task macro returns a Result<SpawnToken, SpawnError> (the pool-full case); unwrap the token then spawn.
   spawner.spawn(ppm_task(ppm).expect("ppm_task token"));
@@ -163,9 +185,10 @@ async fn main(spawner: Spawner) {
   spawner.spawn(button_task(button).expect("button_task token"));
 }
 
-/// PPM reader task. Times rising edges with `Instant`, feeds inter-edge deltas to the decoder, and on each
-/// completed frame publishes the latest pan/tilt as a `Control` into the shared `Signal`. The Signal is lossy
-/// by design — if the LoRa task is mid-transmit, intervening frames are simply overwritten.
+/// PPM reader task. Times FALLING edges with `Instant` (the SKY04X PPM idles high and dips low for each marker),
+/// feeds inter-edge deltas to the decoder, and on each completed frame publishes the latest pan/tilt as a `Control`
+/// into the shared `Signal`. The Signal is lossy by design — if the LoRa task is mid-transmit, intervening frames
+/// are simply overwritten.
 #[embassy_executor::task]
 async fn ppm_task(mut ppm: Input<'static>) {
   // Default Config suppresses corrupt frames (unlike ppm-diag, which surfaces them) — the production node only
@@ -174,7 +197,7 @@ async fn ppm_task(mut ppm: Input<'static>) {
   let mut last_edge: Option<Instant> = None;
 
   loop {
-    ppm.wait_for_rising_edge().await;
+    ppm.wait_for_falling_edge().await;
     let now = Instant::now();
     let Some(prev) = last_edge else {
       last_edge = Some(now);
@@ -220,9 +243,19 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
       continue;
     }
     let payload = enc.into_writer();
-    if let Err(e) = link.send(&payload, TX_POWER_DBM).await {
-      applog::log_println!("LoRa TX error: {:?}", e);
-      continue;
+    // Bounded TX: a never-completing send (missed DIO0 TX-done, likely GPIOTE contention with the PPM edge waits)
+    // would otherwise hang the whole transmit loop forever. On a timeout, drop this cycle and re-prepare the radio
+    // next tick so the link self-heals instead of dying until a reboot.
+    match select(link.send(&payload, TX_POWER_DBM), Timer::after(TX_TIMEOUT)).await {
+      Either::First(Ok(())) => {}
+      Either::First(Err(e)) => {
+        applog::log_println!("LoRa TX error: {:?}", e);
+        continue;
+      }
+      Either::Second(()) => {
+        applog::log_println!("LoRa TX timed out (no TX-done) — recovering");
+        continue;
+      }
     }
 
     // Listen for the truck's Telemetry reply, bounded by REPLY_TIMEOUT so a lost reply cannot stall the loop.
@@ -251,12 +284,22 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
 /// Telemetry reply decoded within `LINK_TIMEOUT`. The lap timer is an elapsed-since-reset stopwatch — richer lap
 /// detection is a future TODO; the button task's `LAP_RESET` re-bases the elapsed-time origin.
 #[embassy_executor::task]
-async fn oled_task(i2c: OledI2c) {
-  let mut oled = match display::StatusDisplay::new(i2c).await {
+async fn oled_task(mut i2c: OledI2c) {
+  // Probe 0x3C/0x3D first so a panel strapped to either address comes up (mirrors the lora-ping bring-up), and a
+  // dead bus (no ACK) is reported distinctly. A missing/miswired panel must not brick the goggle, so either failure
+  // logs and exits the task cleanly — the PPM->LoRa head-tracking path keeps running headless.
+  let addr = match display::probe_address(&mut i2c).await {
+    Some(a) => a,
+    None => {
+      applog::log_println!("OLED not found on I2C (no ACK at 0x3C/0x3D) — OLED task exiting, link still runs");
+      return;
+    }
+  };
+  let mut oled = match display::StatusDisplay::new_with_addr(i2c, addr).await {
     Ok(d) => d,
     Err(e) => {
-      // A missing/miswired panel must not brick the goggle; log and let the task exit cleanly.
-      applog::log_println!("OLED init failed: {:?}", e);
+      // A panel that ACKs but won't init (wrong driver, e.g. SH1106) also must not brick the goggle; log and exit.
+      applog::log_println!("OLED init failed at 0x{:02X}: {:?}", addr, e);
       return;
     }
   };

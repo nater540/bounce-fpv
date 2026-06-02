@@ -6,9 +6,9 @@ edition.workspace = true
 # Truck node binary (Phase D: nRF52840, headless). Receives pan/tilt Control over LoRa and drives two gimbal
 # servos at a fixed rate, reads a GPS for ground speed, and replies with Telemetry. Tasks are wired by
 # latest-value Signals (lossy); servos are NEVER driven from the RX path — a dedicated fixed-rate servo task
-# reads the freshest Control. The OLED moved to the goggle, so there is no display here and the single I2C
-# device (the MPU-6050) uses a direct Twim (no shared_bus). Thin: orchestration only, all real logic lives in
-# the library crates depended on below.
+# reads the freshest Control. A status OLED on the I2C bus shows the received pan/tilt (what the servos act on);
+# it takes the bus AFTER the one-shot boot IMU home read, so the MPU-6050 + OLED need no shared_bus. Thin:
+# orchestration only, all real logic lives in the library crates depended on below.
 [dependencies]
 proto = { workspace = true }
 board = { workspace = true }
@@ -18,6 +18,9 @@ imu = { workspace = true }
 gps = { workspace = true }
 applog = { workspace = true }
 nrf-adapters = { workspace = true }
+# Status OLED on the truck's I2C bus: shows the received pan/tilt + link liveness so head tracking is visible even
+# with the servos unpowered. Generic over an embedded-hal-async I2C, satisfied by the Twim.
+display = { workspace = true }
 
 embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
 embassy-nrf = { workspace = true }

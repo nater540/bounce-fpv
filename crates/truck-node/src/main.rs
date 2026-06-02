@@ -27,6 +27,7 @@
 // any per-binary defmt setup.
 use applog as _;
 
+use core::fmt::Write as _;
 use embassy_executor::Spawner;
 use embassy_nrf::buffered_uarte::{self, BufferedUarteRx};
 use embassy_nrf::pwm::SimplePwm;
@@ -38,6 +39,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
 use gps::GpsReader;
+use heapless::String;
 use micropb::{MessageDecode, MessageEncode, PbEncoder};
 use nrf_adapters::PwmServoChannel;
 use proto::{Control, Telemetry};
@@ -74,21 +76,33 @@ const MAX_HOME_DEG: f32 = 30.0;
 // GPS UART baud. Most modules default to 9600. TODO: confirm against the specific receiver.
 const GPS_BAUD: Baudrate = Baudrate::BAUD9600;
 
-// TX power in dBm for the Telemetry reply (RFM95W PA_BOOST). TODO: tune on hardware / per regional limits.
-const TX_POWER_DBM: i32 = 17;
+// TX power in dBm for the Telemetry reply (RFM95W PA_BOOST). Dropped from 17 to 10 dBm to match the goggle: sustained
+// 17 dBm PA_BOOST transmitting trips the PA's over-current/thermal protection after ~a minute (TX-done fires but no RF
+// radiates). The bench link has ~30 dB of margin, so 10 dBm is ample. TODO: raise only with antenna + heatsink + range.
+const TX_POWER_DBM: i32 = 10;
 
 // PA output routing. The bare RFM95W bonds ONLY its PA_BOOST pin to the antenna, so tx_boost MUST be true or the
 // radiated power is near-zero and the link silently fails to come up (see lora-ping for the full rationale).
 const TX_BOOST: bool = true;
+
+// Status OLED refresh cadence and link-liveness window. The panel only needs a human glance, so a few Hz; the link
+// reads down if no Control has been received within LINK_TIMEOUT (a couple of TX cycles of slack against one drop).
+const OLED_PERIOD: Duration = Duration::from_millis(250);
+const LINK_TIMEOUT: Duration = Duration::from_millis(500);
 
 // Latest pan/tilt command from the radio, consumed by the servo loop (lossy: only the freshest pose matters).
 // CriticalSectionRawMutex because the Signal is a `static` shared across tasks.
 static CONTROL: Signal<CriticalSectionRawMutex, Control> = Signal::new();
 // Latest GPS-derived telemetry from the UART, consumed by the LoRa reply. The reader re-takes it each turnaround.
 static GPS_TELEM: Signal<CriticalSectionRawMutex, Telemetry> = Signal::new();
+// Received pan/tilt (us) for the status OLED, published by the LoRa task ALONGSIDE CONTROL — a Signal hands each
+// value to one taker, so the display needs its own copy separate from the servo loop's CONTROL. Lossy: latest only.
+static DISPLAY_CONTROL: Signal<CriticalSectionRawMutex, (u32, u32)> = Signal::new();
 
 // The radio type lives in `nrf_adapters::lora` now (shared by both nodes + lora-ping so it can never drift); the
-// spawned LoRa task takes `nrf_adapters::lora::Link` directly for its non-generic signature.
+// spawned LoRa task takes `nrf_adapters::lora::Link` directly for its non-generic signature. The status OLED rides a
+// direct (non-shared) Twim — it takes the bus after the one-shot boot IMU read, so no shared_bus Mutex is needed.
+type OledI2c = Twim<'static>;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -118,7 +132,12 @@ async fn main(spawner: Spawner) {
   // is ample for the small command bytes the driver sends.
   static TWIM_TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
   let tx_buf = TWIM_TX_BUF.init([0; 16]);
-  let mut i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, twim::Config::default(), tx_buf);
+  // Enable the internal SDA/SCL pull-ups (Config::default enables NEITHER) so the MPU-6050 ACKs on bare wiring —
+  // the same fix that brought I2C up in lora-ping. Both flags set (embassy-nrf gates both lines off sda_pullup).
+  let mut imu_i2c_cfg = twim::Config::default();
+  imu_i2c_cfg.sda_pullup = true;
+  imu_i2c_cfg.scl_pullup = true;
+  let mut i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, imu_i2c_cfg, tx_buf);
   let mut delay = Delay;
   // Resolve the boot home so the servo loop can trim the gimbal center for a tilted mount. Home is Copy, so it is
   // passed by value into servo_task below.
@@ -185,6 +204,9 @@ async fn main(spawner: Spawner) {
   spawner.spawn(lora_task(link).expect("lora_task token"));
   spawner.spawn(servo_task(pan_pwm, tilt_pwm, home).expect("servo_task token"));
   spawner.spawn(gps_task(GpsReader::new(gps_rx)).expect("gps_task token"));
+  // The one-shot boot IMU read above already released its &mut borrow of the bus, so the Twim is free — hand it to
+  // the status OLED task, which shows the received pan/tilt (no shared_bus needed; the IMU is not read at runtime).
+  spawner.spawn(oled_task(i2c).expect("oled_task token"));
 }
 
 /// LoRa task (link slave). Parks in RX; on each received `Control` it decodes and publishes the latest pose for
@@ -207,6 +229,9 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
 
     let mut control = Control::default();
     if control.decode_from_bytes(&rx_buf[..len]).is_ok() {
+      // Publish to the servo loop AND the status OLED via SEPARATE Signals (a Signal hands each value to one taker).
+      // The OLED copy is the received pan/tilt — exactly what the servo loop acts on — so head tracking stays visible.
+      DISPLAY_CONTROL.signal((control.pan_us, control.tilt_us));
       CONTROL.signal(control);
     } else {
       // CRC-valid but garbage Control: skip the turnaround so we do not waste half-duplex air-time on a reply.
@@ -223,8 +248,15 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
       applog::log_println!("telemetry encode failed");
       continue;
     }
-    let payload = enc.into_writer();
-    if let Err(e) = link.send(&payload, TX_POWER_DBM).await {
+    let encoded = enc.into_writer();
+    // A no-GPS Telemetry is all-zero, and proto3 omits zero-valued scalars — so it encodes to ZERO bytes. A 0-length
+    // LoRa payload does NOT round-trip on the SX1276 (lora-phy writes RegPayloadLength=0, so the transmit never
+    // completes / the goggle's RX never fires) — that is the LINK:N-with-good-radios symptom. Fall back to an
+    // explicit `speed_cm_s = 0` (the 2 bytes [0x08, 0x00] = field 1, varint, value 0), which decodes to the
+    // identical all-default Telemetry on the goggle and keeps the half-duplex reply alive. Any non-empty telemetry
+    // (a real GPS field set) sends as-is. The goggle's Control can never be empty — pan/tilt default to ~1500 us.
+    let payload: &[u8] = if encoded.is_empty() { &[0x08, 0x00] } else { &encoded };
+    if let Err(e) = link.send(payload, TX_POWER_DBM).await {
       applog::log_println!("LoRa TX (telemetry) error: {:?}", e);
     }
   }
@@ -334,6 +366,60 @@ async fn gps_task(mut reader: GpsReader<BufferedUarteRx<'static>>) {
         // panic is caught by panic-persist and reported on the next boot. Pace any retry so we never spin hot.
         Timer::after(Duration::from_millis(100)).await;
       }
+    }
+  }
+}
+
+/// Status OLED task (truck). Drives the same SSD1306 the goggle uses, on the truck's I2C bus, showing the RECEIVED
+/// pan/tilt (exactly what the servo loop acts on) plus link liveness and an RX counter — so head tracking is visible
+/// on the truck even while the servos are unpowered. Probes 0x3C/0x3D; a missing or dead panel just exits the task
+/// and the node runs headless. Renders at OLED_PERIOD via render_lines, kept off the LoRa/servo hot paths.
+#[embassy_executor::task]
+async fn oled_task(mut i2c: OledI2c) {
+  let addr = match display::probe_address(&mut i2c).await {
+    Some(a) => a,
+    None => {
+      applog::log_println!("truck OLED not found (no ACK at 0x3C/0x3D) — OLED task exiting, node runs headless");
+      return;
+    }
+  };
+  let mut oled = match display::StatusDisplay::new_with_addr(i2c, addr).await {
+    Ok(d) => d,
+    Err(e) => {
+      applog::log_println!("truck OLED init failed at 0x{:02X}: {:?}", addr, e);
+      return;
+    }
+  };
+  let _ = oled.render_lines(&["TRUCK", "waiting for", "control..."]).await;
+
+  let mut ticker = Ticker::every(OLED_PERIOD);
+  // Seed at center so the panel reads a sane pose before the first Control arrives.
+  let mut pan_us: u32 = servo::CENTER_PULSE_US as u32;
+  let mut tilt_us: u32 = servo::CENTER_PULSE_US as u32;
+  let mut rx_count: u32 = 0;
+  // Last Control-RX time for link liveness, seeded in the past so the link reads down until the first packet lands.
+  let mut last_rx = Instant::now().saturating_sub(LINK_TIMEOUT);
+
+  loop {
+    ticker.next().await;
+    if let Some((pan, tilt)) = DISPLAY_CONTROL.try_take() {
+      pan_us = pan;
+      tilt_us = tilt;
+      rx_count = rx_count.wrapping_add(1);
+      last_rx = Instant::now();
+    }
+    let link_up = Instant::now().duration_since(last_rx) < LINK_TIMEOUT;
+
+    let mut l_title: String<24> = String::new();
+    let _ = write!(l_title, "TRUCK  LINK:{}", if link_up { "Y" } else { "N" });
+    let mut l_pan: String<24> = String::new();
+    let _ = write!(l_pan, "pan  {} us", pan_us);
+    let mut l_tilt: String<24> = String::new();
+    let _ = write!(l_tilt, "tilt {} us", tilt_us);
+    let mut l_rx: String<24> = String::new();
+    let _ = write!(l_rx, "rx {}", rx_count);
+    if let Err(e) = oled.render_lines(&[&l_title, &l_pan, &l_tilt, &l_rx]).await {
+      applog::log_println!("truck OLED render error: {:?}", e);
     }
   }
 }

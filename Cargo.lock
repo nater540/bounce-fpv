@@ -1335,10 +1335,15 @@ dependencies = [
  "applog",
  "board",
  "cortex-m-rt",
+ "display",
  "embassy-executor",
+ "embassy-futures",
  "embassy-nrf",
+ "embassy-sync",
  "embassy-time",
+ "heapless 0.9.3",
  "ppm-decoder",
+ "static_cell",
 ]
 
 [[package]]
@@ -1866,6 +1871,7 @@ dependencies = [
  "applog",
  "board",
  "cortex-m-rt",
+ "display",
  "embassy-executor",
  "embassy-nrf",
  "embassy-sync",

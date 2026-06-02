@@ -17,6 +17,9 @@ link-id = { workspace = true }
 nrf-adapters = { workspace = true }
 display = { workspace = true }
 applog = { workspace = true }
+# Only for the shared AT_HOME_M threshold (a plain const), so the goggle's "at home" cutoff matches the truck's
+# nav math. The goggle does NOT compute the nav — the truck does — it just displays the relayed distance/bearing.
+geo = { workspace = true }
 
 embassy-executor = { workspace = true, features = ["platform-cortex-m", "executor-thread"] }
 embassy-nrf = { workspace = true }

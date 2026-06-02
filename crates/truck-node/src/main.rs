@@ -12,8 +12,9 @@
 //!   - `servo_task` — builds the two 50 Hz `SimplePwm` outputs (PWM0 pan, PWM1 tilt), wraps each in
 //!     `servo::Servo`, and at a fixed ~50 Hz reads the latest `Control`, applies the boot IMU home trim, clamps
 //!     into the servo band, and drives the PWM duty. Never touches the radio, so RX jitter never reaches servos.
-//!   - `gps_task`   — `BufferedUarteRx` -> `gps::GpsReader`; publishes each speed fix as a `Telemetry` for the
-//!     LoRa reply.
+//!   - `gps_task`   — `BufferedUarteRx` -> `gps::GpsReader`; latches a home point at the first valid fix, computes
+//!     distance + bearing to it via `geo::nav`, and publishes each fix as a `Telemetry` (speed + nav) for the LoRa
+//!     reply. A `SET_HOME` signal (raised when a received Control carries the re-home flag) re-latches home.
 //!
 //! Half-duplex turnaround (scaffold scheme, tunable later): the goggle is master, the truck is slave. The truck
 //! parks in continuous RX; on each received Control it applies it and immediately TXes the latest Telemetry,
@@ -75,6 +76,11 @@ const MAX_HOME_DEG: f32 = 30.0;
 // GPS UART baud. Most modules default to 9600. TODO: confirm against the specific receiver.
 const GPS_BAUD: Baudrate = Baudrate::BAUD9600;
 
+// Minimum satellites before the home point is latched (and before distance/bearing are reported valid). A 1-2
+// satellite "fix" is positionally garbage and would anchor home tens of meters off; 4 is the floor for a usable
+// 3D fix. The fix-quality field must also be non-zero. TODO: tune against the receiver's reported sat counts.
+const MIN_SATS_FOR_HOME: u32 = 4;
+
 // TX power in dBm for the Telemetry reply (RFM95W PA_BOOST). Dropped from 17 to 10 dBm to match the goggle: sustained
 // 17 dBm PA_BOOST transmitting trips the PA's over-current/thermal protection after ~a minute (TX-done fires but no RF
 // radiates). The bench link has ~30 dB of margin, so 10 dBm is ample. TODO: raise only with antenna + heatsink + range.
@@ -131,6 +137,9 @@ static LINK_RSSI: Signal<CriticalSectionRawMutex, i16> = Signal::new();
 // Latest LoRa link state (Connected/Tentative/Disconnected) published by the LoRa task on each change. Surfaced for
 // the status display; the OLED derives liveness from the Control-RX timeout instead, but this stays published for logs.
 static LINK_STATE: Signal<CriticalSectionRawMutex, lora_link::LinkState> = Signal::new();
+// Manual re-home request: the LoRa task signals this when a received Control carries the re-home flag (bit0), and
+// gps_task drops its captured home so the next valid fix re-latches it. Unit payload — only the edge matters.
+static SET_HOME: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 // The radio type lives in `nrf_adapters::lora` now (shared by both nodes + lora-ping so it can never drift); the
 // spawned LoRa task takes `nrf_adapters::lora::Link` directly for its non-generic signature. The status OLED rides a
@@ -278,13 +287,21 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
             // also serves as the OLED's link-liveness heartbeat). Published only here, in the decoded-Control
             // branch, so foreign frames never move the bars or falsely mark the link live.
             LINK_RSSI.signal(status.rssi);
+            // A re-home command (flags bit0) asks gps_task to drop its home so the next valid fix re-latches it.
+            // Checked before publishing so the request rides the same Control the operator pressed it on.
+            if control.flags & 1 != 0 {
+              SET_HOME.signal(());
+            }
             CONTROL.signal(control);
 
             // Refresh the reply payload from the latest GPS fix (if any), then frame + transmit the turnaround.
             if let Some(latest) = GPS_TELEM.try_take() {
               telem = latest;
             }
-            let mut enc = PbEncoder::new(heapless::Vec::<u8, 18>::new());
+            // Telemetry now carries dist_m/bearing_deg/nav_valid on top of speed/sats/fix. Worst case is exactly
+            // 32 B (five uint32 at 6 B each + a 2 B bool); 40/44 give headroom over that exact fit, both well
+            // under MAX_PAYLOAD (64). Encode failure is still handled gracefully below, not via a panic.
+            let mut enc = PbEncoder::new(heapless::Vec::<u8, 40>::new());
             if telem.encode(&mut enc).is_err() {
               // An encode/frame failure is a data bug, not a radio fault — the RX leg is proven alive, so don't re-init.
               applog::log_println!("telemetry encode failed");
@@ -294,7 +311,7 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
               // ZERO bytes still produces a non-empty 4-byte LoRa payload — which incidentally retires the old
               // 0-length-payload workaround (a 0-byte SX1276 transmit never completed and was the LINK:N symptom).
               let payload = enc.into_writer();
-              let mut framed = heapless::Vec::<u8, 22>::new();
+              let mut framed = heapless::Vec::<u8, 44>::new();
               if link_id::frame(&BINDING, &payload, &mut framed).is_err() {
                 applog::log_println!("telemetry frame overflow");
                 outcome = Some(true);
@@ -375,7 +392,8 @@ async fn servo_task(pan_pwm: SimplePwm<'static>, tilt_pwm: SimplePwm<'static>, h
   let tilt_trim = bounded_home_trim(home.pitch_deg, "pitch");
 
   let mut ticker = Ticker::every(SERVO_PERIOD);
-  let center = Control { pan_us: servo::CENTER_PULSE_US as u32, tilt_us: servo::CENTER_PULSE_US as u32 };
+  let center =
+    Control { pan_us: servo::CENTER_PULSE_US as u32, tilt_us: servo::CENTER_PULSE_US as u32, flags: 0 };
   let mut latest = center;
   // Timestamp of the last accepted Control, for the loss-of-signal failsafe.
   let mut last_control = Instant::now();
@@ -434,19 +452,67 @@ fn bounded_home_trim(deg: f32, axis: &str) -> i32 {
   }
 }
 
-/// GPS task. Reads NMEA from the UART and on each speed fix publishes a `Telemetry` for the LoRa reply. Lossy
-/// Signal: only the latest fix matters to the reply.
+/// GPS task. Reads NMEA from the UART and on each speed fix publishes a `Telemetry` for the LoRa reply (and a
+/// copy for the OLED). It also owns the home point: the FIRST fix with a real position (fix quality != 0,
+/// >= `MIN_SATS_FOR_HOME` satellites, coordinates present) latches home, and from then on each fix carries the
+/// distance + bearing from home to the truck (computed here via `geo::nav`, so the goggle only displays them).
+/// A `SET_HOME` signal (raised by the LoRa task on a re-home command) drops home so the next valid fix re-latches
+/// it. Lossy Signals: only the latest fix matters to the reply.
 #[embassy_executor::task]
 async fn gps_task(mut reader: GpsReader<BufferedUarteRx<'static>>) {
+  // The captured launch point; `None` until the first valid fix (or after a re-home request clears it).
+  let mut home: Option<geo::CoordE7> = None;
+
   loop {
     match reader.next_fix().await {
       Ok(fix) => {
+        // A re-home request clears the latched home so the current fix below re-establishes it.
+        if SET_HOME.try_take().is_some() {
+          home = None;
+          applog::log_println!("GPS re-home requested — home cleared, will re-latch at next valid fix");
+        }
+
         let sats = fix.satellites.unwrap_or(0) as u32;
         let fix_quality = fix.fix.map(|f| f.raw as u32).unwrap_or(0);
+
+        // The gps crate only surfaces coordinates for a usable fix (RMC status 'A' or GGA quality != 0), so a
+        // present position is already trustworthy. Gate on the coordinate's PRESENCE, never on its value (0,0 is a
+        // valid point). Critically, do NOT also require sats/fix_quality here: those ride GGA only, so an RMC-only
+        // receiver (which carries position but no sat count) would otherwise never produce a usable position.
+        let position = match (fix.lat_e7, fix.lon_e7) {
+          (Some(lat_e7), Some(lon_e7)) => Some(geo::CoordE7 { lat_e7, lon_e7 }),
+          _ => None,
+        };
+        // Home is anchored on a STRONG fix: a position plus a decent satellite count WHEN one is reported. The
+        // strict sat floor is a one-time guard so a weak first fix can't anchor home tens of meters off; when sats
+        // are unknown (RMC-only), the 'A'-validated position is the best signal available, so accept it.
+        let strong_fix = fix.satellites.is_none_or(|s| s as u32 >= MIN_SATS_FOR_HOME);
+
+        // Once home is latched, ANY later valid position keeps reporting nav — a brief satellite dip still yields a
+        // usable position, and blanking the "find my truck" readout back to ACQUIRING there would be worse than a
+        // slightly noisier distance. nav_valid is false only until home is first anchored (or right after a re-home).
+        let (dist_m, bearing_deg, nav_valid) = match position {
+          Some(cur) => {
+            if home.is_none() && strong_fix {
+              home = Some(cur);
+              applog::log_println!("GPS home latched: lat_e7 {} lon_e7 {} (sats {})", cur.lat_e7, cur.lon_e7, sats);
+            }
+            match home {
+              Some(h) => {
+                let nav = geo::nav(h, cur);
+                (nav.distance_m, nav.bearing_deg as u32, true)
+              }
+              None => (0, 0, false), // have a position, but no strong-enough fix yet to anchor home.
+            }
+          }
+          None => (0, 0, false),
+        };
+
         // Publish to BOTH the LoRa reply (GPS_TELEM) and the OLED (SPEED_DISPLAY) via separate Signals — a Signal
-        // hands each value to one taker. Build the small all-u32 struct twice rather than relying on Telemetry: Clone.
-        GPS_TELEM.signal(Telemetry { speed_cm_s: fix.speed_cm_s, sats, fix_quality });
-        SPEED_DISPLAY.signal(Telemetry { speed_cm_s: fix.speed_cm_s, sats, fix_quality });
+        // hands each value to one taker. Build the small all-scalar struct twice rather than relying on Telemetry: Clone.
+        let telem = Telemetry { speed_cm_s: fix.speed_cm_s, sats, fix_quality, dist_m, bearing_deg, nav_valid };
+        GPS_TELEM.signal(telem);
+        SPEED_DISPLAY.signal(telem);
       }
       Err(_) => {
         // embassy-nrf 0.10's BufferedUarteRx Error enum is empty and a UART overrun or ring-buffer-full PANICS

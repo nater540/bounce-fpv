@@ -134,6 +134,21 @@ pub struct TruckStatus {
   pub linked: bool,  // whether the link is live (gates the RSSI number)
 }
 
+/// Status for the goggle node's "Find my truck" Nav screen: the truck's distance + bearing from its home point
+/// (both computed truck-side and relayed over telemetry). Integer/bool throughout — distance is whole meters and
+/// bearing whole degrees, formatted with no float — so it derives `Eq` for the dirty-check and keeps the render
+/// path float-free. `nav_valid` gates the readout (false while the truck has no home/fix); `at_home` suppresses
+/// the bearing when the truck sits within GPS noise of home (where the bearing would otherwise spin).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NavStatus {
+  pub dist_m: u32,       // distance home -> truck, whole meters
+  pub bearing_deg: u16,  // bearing home -> truck, 0..359, 0 = North
+  pub nav_valid: bool,   // truck has a captured home AND a current fix; gates the whole readout
+  pub at_home: bool,     // truck is within a few meters of home — show "AT HOME" instead of a bearing
+  pub sats: u32,         // GPS satellites in view (relayed from the truck), shown "SVnn"
+  pub bars: u8,          // LoRa signal bars, 0..4
+}
+
 /// Converts centimeters/second to whole mph with integer rounding. 1 mile = 160 934 cm, so
 /// mph = cm_s * 3600 / 160934 (the +160934/2 rounds to nearest). The multiply is widened to u64 so `cm_s * 3600`
 /// cannot overflow u32 (it would for cm_s > ~1.19M, wrapping silently in release) — mirrors [`cm_s_to_kmh`].
@@ -181,6 +196,7 @@ pub struct StatusDisplay<I: I2c> {
   last: Option<Status>,
   last_goggle: Option<GoggleStatus>,
   last_truck: Option<TruckStatus>,
+  last_nav: Option<NavStatus>,
 }
 
 impl<I: I2c> StatusDisplay<I> {
@@ -198,7 +214,7 @@ impl<I: I2c> StatusDisplay<I> {
     let mut display =
       Ssd1306Async::new(interface, DisplaySize128x64, DisplayRotation::Rotate0).into_buffered_graphics_mode();
     display.init().await?;
-    Ok(Self { display, last: None, last_goggle: None, last_truck: None })
+    Ok(Self { display, last: None, last_goggle: None, last_truck: None, last_nav: None })
   }
 
   /// Clears the buffer, draws the status lines, and flushes to the panel over I2C. Four lines: a title, the
@@ -236,6 +252,7 @@ impl<I: I2c> StatusDisplay<I> {
     self.last = Some(status);
     self.last_goggle = None;
     self.last_truck = None;
+    self.last_nav = None;
     Ok(())
   }
 
@@ -255,6 +272,7 @@ impl<I: I2c> StatusDisplay<I> {
     self.last = None;
     self.last_goggle = None;
     self.last_truck = None;
+    self.last_nav = None;
     self.display.flush().await
   }
 
@@ -306,6 +324,7 @@ impl<I: I2c> StatusDisplay<I> {
     self.last_goggle = Some(st);
     self.last = None;
     self.last_truck = None;
+    self.last_nav = None;
     Ok(())
   }
 
@@ -346,6 +365,53 @@ impl<I: I2c> StatusDisplay<I> {
     self.last_truck = Some(st);
     self.last = None;
     self.last_goggle = None;
+    self.last_nav = None;
+    Ok(())
+  }
+
+  /// Renders the goggle node's "Find my truck" Nav screen: the truck's distance + bearing from home, with the
+  /// satellite count and LoRa bars in the header (same header geometry as the G1 stopwatch screen). The big
+  /// readout is the distance ("847m" / "1.2km"); the line below the divider is the bearing as an 8-point compass
+  /// heading plus degrees ("BRG SE 132"). Before the truck has a home + fix the readout reads "--" / "ACQUIRING";
+  /// within a few meters of home it reads "AT HOME" (no bearing). Dirty-checked against the last `NavStatus`.
+  pub async fn render_nav(&mut self, st: NavStatus) -> Result<(), display_interface::DisplayError> {
+    if self.last_nav == Some(st) {
+      return Ok(());
+    }
+    let d = &mut self.display;
+    d.clear_buffer();
+
+    // Header (yellow rows 0-15): label, GPS sats, link bars — mirrors render_goggle so the two goggle screens
+    // share a consistent top strip as the button cycles between them.
+    text(d, "NAV", 2, 4, TEXT_STYLE, TS_TOP_LEFT);
+    let mut sats: String<16> = String::new();
+    let _ = write!(sats, "SV{}", Pad2(st.sats));
+    text(d, &sats, 110, 4, TEXT_STYLE, TS_TOP_RIGHT);
+    signal_bars(d, 114, 3, st.bars);
+
+    // Data (blue rows 16-63): big distance/status centered, divider, bearing line. Coordinates mirror the G1
+    // metrics (big readout top at y26 clears the y50 divider; the line below sits at y54).
+    let mut big: String<16> = String::new();
+    let mut sub: String<16> = String::new();
+    if !st.nav_valid {
+      let _ = write!(big, "--");
+      let _ = write!(sub, "ACQUIRING");
+    } else if st.at_home {
+      let _ = write!(big, "AT HOME");
+      let _ = write!(sub, "{}m", st.dist_m);
+    } else {
+      let _ = write!(big, "{}", fmt_distance(st.dist_m));
+      let _ = write!(sub, "BRG {} {}", cardinal(st.bearing_deg), st.bearing_deg);
+    }
+    text(d, &big, 64, 26, BIG_STYLE, TS_TOP_CENTER);
+    hline(d, 8, 50, 112);
+    text(d, &sub, 64, 54, TEXT_STYLE, TS_TOP_CENTER);
+
+    self.display.flush().await?;
+    self.last_nav = Some(st);
+    self.last = None;
+    self.last_goggle = None;
+    self.last_truck = None;
     Ok(())
   }
 }
@@ -353,6 +419,36 @@ impl<I: I2c> StatusDisplay<I> {
 /// Renders a flag as "Y"/"N" for the compact status line.
 fn yn(b: bool) -> &'static str {
   if b { "Y" } else { "N" }
+}
+
+/// Formats a distance in whole meters for the Nav screen: "847m" below 1 km, else tenths of a km ("1.2km",
+/// "12.4km"), and whole km once past 100 km ("123km"). Integer-only (no float), and the widest output ("123km")
+/// fits the 8-char buffer. Tenths round to nearest (`+50` before the /100).
+pub fn fmt_distance(dist_m: u32) -> String<8> {
+  let mut s = String::new();
+  if dist_m < 1000 {
+    let _ = write!(s, "{}m", dist_m);
+  } else {
+    // Distance in tenths of a km, rounded to nearest 0.1 km. Widened to u64 so `dist_m + 50` cannot overflow:
+    // dist_m is an unvalidated u32 straight off the wire, so a corrupt telemetry value near u32::MAX must not wrap
+    // (it would render a maximal distance as a tiny one). Mirrors the u64-widening in cm_s_to_kmh/cm_s_to_mph.
+    let tenths = ((dist_m as u64 + 50) / 100) as u32;
+    let km = tenths / 10;
+    if km >= 100 {
+      let _ = write!(s, "{}km", km.min(999)); // very far: drop the fraction so it always fits.
+    } else {
+      let _ = write!(s, "{}.{}km", km, tenths % 10);
+    }
+  }
+  s
+}
+
+/// Maps a bearing in degrees (0..359, 0 = North) to an 8-point compass abbreviation. Each 45° sector is centered
+/// on its cardinal/intercardinal point, so 338..22 = N, 23..67 = NE, and so on; the `+22` then `/45` rounds into
+/// the nearest sector and `% 8` folds the wrap at 360 back to N.
+fn cardinal(bearing_deg: u16) -> &'static str {
+  const DIRS: [&str; 8] = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  DIRS[(((bearing_deg as u32 + 22) / 45) % 8) as usize]
 }
 
 // ---- low-level draw helpers (port of the design's oled.js primitives) -------------------------------------------
@@ -522,6 +618,44 @@ mod tests {
     assert_eq!(base, base);
     assert_ne!(base, TruckStatus { mph: 43, ..base });
     assert_ne!(base, TruckStatus { linked: false, ..base });
+  }
+
+  #[test]
+  fn fmt_distance_meters_then_km() {
+    assert_eq!(fmt_distance(0).as_str(), "0m");
+    assert_eq!(fmt_distance(847).as_str(), "847m");
+    assert_eq!(fmt_distance(999).as_str(), "999m");
+    assert_eq!(fmt_distance(1000).as_str(), "1.0km"); //  exactly 1 km.
+    assert_eq!(fmt_distance(1234).as_str(), "1.2km"); //  1.234 km rounds to 1.2.
+    assert_eq!(fmt_distance(1250).as_str(), "1.3km"); //  1.25 km rounds up to 1.3.
+    assert_eq!(fmt_distance(12_400).as_str(), "12.4km");
+    assert_eq!(fmt_distance(123_456).as_str(), "123km"); //  past 100 km: whole km, still <= 8 chars.
+  }
+
+  #[test]
+  fn cardinal_sectors_center_on_their_point() {
+    assert_eq!(cardinal(0), "N");
+    assert_eq!(cardinal(359), "N"); //  wraps back to N.
+    assert_eq!(cardinal(45), "NE");
+    assert_eq!(cardinal(90), "E");
+    assert_eq!(cardinal(132), "SE");
+    assert_eq!(cardinal(180), "S");
+    assert_eq!(cardinal(225), "SW");
+    assert_eq!(cardinal(270), "W");
+    assert_eq!(cardinal(315), "NW");
+    assert_eq!(cardinal(22), "N"); //  upper edge of the N sector.
+    assert_eq!(cardinal(23), "NE"); //  first degree of NE.
+  }
+
+  #[test]
+  fn nav_status_participates_in_dirty_check() {
+    // The render dirty-check is `self.last_nav == Some(st)`, so any changed field must make two unequal.
+    let base = NavStatus { dist_m: 847, bearing_deg: 132, nav_valid: true, at_home: false, sats: 9, bars: 3 };
+    assert_eq!(base, base);
+    assert_ne!(base, NavStatus { dist_m: 848, ..base });
+    assert_ne!(base, NavStatus { bearing_deg: 133, ..base });
+    assert_ne!(base, NavStatus { at_home: true, ..base });
+    assert_ne!(base, NavStatus { nav_valid: false, ..base });
   }
 
   #[test]

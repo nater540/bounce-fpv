@@ -1,0 +1,13 @@
+[package]
+name = "link-id"
+version.workspace = true
+edition.workspace = true
+
+# ExpressLRS-style "binding phrase" for the point-to-point LoRa link. A compile-time phrase is hashed into a
+# 6-byte UID (FNV-1a, no crypto dependency — a binding phrase is an anti-collision address, not a secret), from
+# which a 2-byte link-id prefix and a 16-bit CRC initializer are derived. `frame`/`deframe` wrap a payload as
+# [link_id][payload][crc16] so a receiver silently drops any frame whose link-id or UID-seeded CRC don't match,
+# the way ELRS uses its UID-derived CRC initializer as a de-facto address filter. Pure bytes-in/bytes-out, no
+# radio or HAL deps, so it builds standalone and unit-tests on the host (`cargo test -p link-id`).
+[dependencies]
+heapless = { workspace = true }

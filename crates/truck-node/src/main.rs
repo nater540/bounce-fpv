@@ -29,6 +29,7 @@ use applog as _;
 
 use core::fmt::Write as _;
 use embassy_executor::Spawner;
+use embassy_futures::select::{select, Either};
 use embassy_nrf::buffered_uarte::{self, BufferedUarteRx};
 use embassy_nrf::pwm::SimplePwm;
 use embassy_nrf::spim;
@@ -85,6 +86,34 @@ const TX_POWER_DBM: i32 = 10;
 // radiated power is near-zero and the link silently fails to come up (see lora-ping for the full rationale).
 const TX_BOOST: bool = true;
 
+// Bound on the otherwise-unbounded continuous RX. Without it the task parks on the DIO0 IRQ forever when the goggle
+// goes silent and never re-arms. Must comfortably exceed the goggle's 40 ms TX_PERIOD so a normal inter-packet gap
+// never trips it; 200 ms ~= 5 missed controls. On a timeout we count a miss toward the radio self-heal. TODO: tune.
+const RX_TIMEOUT: Duration = Duration::from_millis(200);
+
+// Upper bound on the telemetry turnaround transmit. `send()` blocks on the DIO0 TX-done IRQ; if that IRQ is missed
+// (the same PA-latch / GPIOTE-contention class the goggle guards against) the unbounded await would park this whole
+// task forever — so a stuck truck-side TX could never reach the self-heal below. 30 ms is ~3x the ~10 ms SF7/BW500
+// airtime, so a healthy reply never trips it; a timeout instead feeds the radio re-init as a likely TX-leg fault.
+const TX_TIMEOUT: Duration = Duration::from_millis(30);
+
+// Self-heal threshold: after this many consecutive radio-fault windows — RX silence, an RX error, or our own reply
+// TX stalling — hardware-re-init the radio to clear a stuck RX/TX stage. Foreign frames from another pair do NOT
+// count (the RX path clearly works), so a busy neighbor can't drive spurious re-inits. By wall-clock the truck
+// re-inits at ~5*200 ms = 1 s while the goggle (master) leads at ~8*40 ms = 320 ms, so the two ends don't reset in
+// lockstep and miss each other's first post-reset packets.
+const REINIT_AFTER_MISSES: u32 = 5;
+
+// Back-off threshold once Disconnected: after the first re-init fails to recover the link, a missing goggle and a
+// dead local radio look identical, so retry slowly (25 * 200 ms = ~5 s) instead of RESET-pulsing every ~1 s forever.
+// Drops back to the fast REINIT_AFTER_MISSES the moment a valid Control re-marks us Connected.
+const REINIT_BACKOFF_MISSES: u32 = 25;
+
+// LoRa binding: phrase -> UID -> link-id + CRC initializer, derived at compile time from BINDING_PHRASE (defaulted in
+// build.rs). MUST match the goggle's phrase. Every received frame is checked against it (link-id + CRC) so traffic
+// from a differently bound pair is dropped, and our replies carry the same tag — ExpressLRS-style anti-collision.
+const BINDING: link_id::Binding = link_id::derive(env!("BINDING_PHRASE"));
+
 // Status OLED refresh cadence and link-liveness window. The panel only needs a human glance, so a few Hz; the link
 // reads down if no Control has been received within LINK_TIMEOUT (a couple of TX cycles of slack against one drop).
 const OLED_PERIOD: Duration = Duration::from_millis(250);
@@ -98,6 +127,9 @@ static GPS_TELEM: Signal<CriticalSectionRawMutex, Telemetry> = Signal::new();
 // Received pan/tilt (us) for the status OLED, published by the LoRa task ALONGSIDE CONTROL — a Signal hands each
 // value to one taker, so the display needs its own copy separate from the servo loop's CONTROL. Lossy: latest only.
 static DISPLAY_CONTROL: Signal<CriticalSectionRawMutex, (u32, u32)> = Signal::new();
+// Latest LoRa link state (Connected/Tentative/Disconnected) published by the LoRa task on each change. Surfaced for
+// the status display; the OLED task does not consume it yet (the UI is being reworked) — it is here so it can.
+static LINK_STATE: Signal<CriticalSectionRawMutex, lora_link::LinkState> = Signal::new();
 
 // The radio type lives in `nrf_adapters::lora` now (shared by both nodes + lora-ping so it can never drift); the
 // spawned LoRa task takes `nrf_adapters::lora::Link` directly for its non-generic signature. The status OLED rides a
@@ -217,47 +249,99 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
   let mut rx_buf = [0u8; lora_link::MAX_PAYLOAD as usize];
   // Most recent telemetry to reply with; updated from the GPS Signal each loop, defaults to "no fix".
   let mut telem = Telemetry::default();
+  // Owns the self-heal: counts radio-fault windows, re-inits at the threshold, then backs off while Disconnected.
+  let mut health = lora_link::LinkHealth::new(REINIT_AFTER_MISSES, REINIT_BACKOFF_MISSES);
+  // Last published link state, so we only signal LINK_STATE on a change rather than every RX window.
+  let mut last_state = health.state();
+  LINK_STATE.signal(last_state);
 
   loop {
-    let len = match link.receive(&mut rx_buf).await {
-      Ok(len) => len,
-      Err(e) => {
-        applog::log_println!("LoRa RX error: {:?}", e);
-        continue;
+    // Each window classifies the radio's health for the self-heal at the bottom:
+    //   Some(true)  — a faultless round-trip (heard our goggle, and any reply went out): clear the streak.
+    //   Some(false) — a fault a radio reset could fix (RX silence, RX error, or our reply TX stalling): count it.
+    //   None        — a foreign/corrupt frame: the RX path demonstrably works, it just wasn't for us, so leave the
+    //                  streak untouched. Counting these as misses let a nearby second pair's traffic trigger spurious
+    //                  re-inits (each foreign frame returns from receive() immediately, racing to the threshold).
+    let outcome: Option<bool>;
+
+    // Bounded RX: without the timeout this awaits the DIO0 IRQ forever, so a silent goggle would park us until a
+    // packet happens to land.
+    match select(link.receive(&mut rx_buf), Timer::after(RX_TIMEOUT)).await {
+      Either::First(Ok(len)) => {
+        if let Some(bytes) = link_id::deframe(&BINDING, &rx_buf[..len]) {
+          // A frame that passes the binding (link-id + CRC) is ours. Decode the Control, publish it, then turn around
+          // the Telemetry reply. The round-trip is healthy unless our own reply transmit stalls (handled below).
+          let mut control = Control::default();
+          if control.decode_from_bytes(bytes).is_ok() {
+            // Publish to the servo loop AND the status OLED via SEPARATE Signals (a Signal hands each value to one
+            // taker). The OLED copy is the received pan/tilt — what the servo loop acts on — so tracking stays visible.
+            DISPLAY_CONTROL.signal((control.pan_us, control.tilt_us));
+            CONTROL.signal(control);
+
+            // Refresh the reply payload from the latest GPS fix (if any), then frame + transmit the turnaround.
+            if let Some(latest) = GPS_TELEM.try_take() {
+              telem = latest;
+            }
+            let mut enc = PbEncoder::new(heapless::Vec::<u8, 18>::new());
+            if telem.encode(&mut enc).is_err() {
+              // An encode/frame failure is a data bug, not a radio fault — the RX leg is proven alive, so don't re-init.
+              applog::log_println!("telemetry encode failed");
+              outcome = Some(true);
+            } else {
+              // Framing prepends link-id + appends CRC, so even an all-zero (no-GPS) Telemetry that proto3 encodes to
+              // ZERO bytes still produces a non-empty 4-byte LoRa payload — which incidentally retires the old
+              // 0-length-payload workaround (a 0-byte SX1276 transmit never completed and was the LINK:N symptom).
+              let payload = enc.into_writer();
+              let mut framed = heapless::Vec::<u8, 22>::new();
+              if link_id::frame(&BINDING, &payload, &mut framed).is_err() {
+                applog::log_println!("telemetry frame overflow");
+                outcome = Some(true);
+              } else {
+                // Bound the turnaround TX so a missed TX-done IRQ can't park the task forever (the original
+                // "dies until reboot" failure, on the truck's TX leg). A timeout/error means our TX stage may be
+                // dead, so mark it a radio fault → it feeds the self-heal; a clean send is a healthy round-trip.
+                match select(link.send(&framed, TX_POWER_DBM), Timer::after(TX_TIMEOUT)).await {
+                  Either::First(Ok(())) => outcome = Some(true),
+                  Either::First(Err(e)) => {
+                    applog::log_println!("LoRa TX (telemetry) error: {:?}", e);
+                    outcome = Some(false);
+                  }
+                  Either::Second(()) => {
+                    applog::log_println!("telemetry TX timed out (no TX-done) — recovering");
+                    outcome = Some(false);
+                  }
+                }
+              }
+            }
+          } else {
+            // Binding-valid but garbage Control: RX leg alive, so skip the reply but don't re-init the radio.
+            applog::log_println!("control decode failed ({} bytes)", bytes.len());
+            outcome = Some(true);
+          }
+        } else {
+          // Foreign/corrupt frame: the radio received fine, it just isn't ours — neutral for the self-heal.
+          outcome = None;
+        }
       }
-    };
-
-    let mut control = Control::default();
-    if control.decode_from_bytes(&rx_buf[..len]).is_ok() {
-      // Publish to the servo loop AND the status OLED via SEPARATE Signals (a Signal hands each value to one taker).
-      // The OLED copy is the received pan/tilt — exactly what the servo loop acts on — so head tracking stays visible.
-      DISPLAY_CONTROL.signal((control.pan_us, control.tilt_us));
-      CONTROL.signal(control);
-    } else {
-      // CRC-valid but garbage Control: skip the turnaround so we do not waste half-duplex air-time on a reply.
-      applog::log_println!("control decode failed ({} bytes)", len);
-      continue;
+      Either::First(Err(e)) => {
+        applog::log_println!("LoRa RX error: {:?}", e);
+        outcome = Some(false);
+      }
+      Either::Second(()) => outcome = Some(false), // RX silence this window — a genuine "heard nothing" fault.
     }
 
-    // Refresh the reply payload from the latest GPS fix (if any), then transmit it as the turnaround response.
-    if let Some(latest) = GPS_TELEM.try_take() {
-      telem = latest;
+    // Self-heal: LinkHealth folds the outcome (Some(true)=clean, Some(false)=radio fault, None=foreign/neutral),
+    // re-inits the radio past the threshold to clear a stuck RX/TX stage, and backs off once Disconnected.
+    match health.service(outcome, &mut link).await {
+      lora_link::Serviced::Reinited(Ok(())) => applog::log_println!("radio re-init OK"),
+      lora_link::Serviced::Reinited(Err(e)) => applog::log_println!("radio re-init failed: {:?}", e),
+      lora_link::Serviced::Idle => {}
     }
-    let mut enc = PbEncoder::new(heapless::Vec::<u8, 18>::new());
-    if telem.encode(&mut enc).is_err() {
-      applog::log_println!("telemetry encode failed");
-      continue;
-    }
-    let encoded = enc.into_writer();
-    // A no-GPS Telemetry is all-zero, and proto3 omits zero-valued scalars — so it encodes to ZERO bytes. A 0-length
-    // LoRa payload does NOT round-trip on the SX1276 (lora-phy writes RegPayloadLength=0, so the transmit never
-    // completes / the goggle's RX never fires) — that is the LINK:N-with-good-radios symptom. Fall back to an
-    // explicit `speed_cm_s = 0` (the 2 bytes [0x08, 0x00] = field 1, varint, value 0), which decodes to the
-    // identical all-default Telemetry on the goggle and keeps the half-duplex reply alive. Any non-empty telemetry
-    // (a real GPS field set) sends as-is. The goggle's Control can never be empty — pan/tilt default to ~1500 us.
-    let payload: &[u8] = if encoded.is_empty() { &[0x08, 0x00] } else { &encoded };
-    if let Err(e) = link.send(payload, TX_POWER_DBM).await {
-      applog::log_println!("LoRa TX (telemetry) error: {:?}", e);
+    // Publish link state for the status display only when it changes (the OLED does not consume it yet).
+    let state = health.state();
+    if state != last_state {
+      last_state = state;
+      LINK_STATE.signal(state);
     }
   }
 }

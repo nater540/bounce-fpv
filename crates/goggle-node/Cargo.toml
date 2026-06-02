@@ -13,6 +13,7 @@ proto = { workspace = true }
 board = { workspace = true }
 ppm-decoder = { workspace = true }
 lora-link = { workspace = true }
+link-id = { workspace = true }
 nrf-adapters = { workspace = true }
 display = { workspace = true }
 applog = { workspace = true }

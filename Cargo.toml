@@ -5,6 +5,7 @@ members = [
   "crates/board",        # pin-maps; board-xiao / board-devkit feature selection
   "crates/ppm-decoder",  # reusable PPM frame decoder
   "crates/lora-link",    # LoRa radio setup + TX/RX helpers (lora-phy / SX1276)
+  "crates/link-id",      # ExpressLRS-style binding phrase -> UID -> link-id + CRC frame filter
   "crates/servo",        # LEDC servo PWM mapping
   "crates/imu",          # MPU-6050 home/center detection
   "crates/display",      # SSD1306 OLED status
@@ -117,6 +118,7 @@ proto = { path = "crates/proto" }
 board = { path = "crates/board" }
 ppm-decoder = { path = "crates/ppm-decoder" }
 lora-link = { path = "crates/lora-link" }
+link-id = { path = "crates/link-id" }
 servo = { path = "crates/servo" }
 imu = { path = "crates/imu" }
 display = { path = "crates/display" }

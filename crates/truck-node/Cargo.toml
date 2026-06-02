@@ -14,6 +14,7 @@ proto = { workspace = true }
 board = { workspace = true }
 servo = { workspace = true }
 lora-link = { workspace = true }
+link-id = { workspace = true }
 imu = { workspace = true }
 gps = { workspace = true }
 applog = { workspace = true }
@@ -26,6 +27,8 @@ embassy-executor = { workspace = true, features = ["platform-cortex-m", "executo
 embassy-nrf = { workspace = true }
 embassy-time = { workspace = true }
 embassy-sync = { workspace = true }
+# select() bounds the otherwise-unbounded continuous RX so a silent goggle never parks the task forever.
+embassy-futures = { workspace = true }
 cortex-m-rt = { workspace = true }
 # The boot IMU home routine takes a `&mut Delay`; embedded-hal-async names the DelayNs trait it bounds on.
 embedded-hal-async = { workspace = true }

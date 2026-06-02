@@ -90,6 +90,22 @@ const TX_POWER_DBM: i32 = 10;
 // radiated power is near-zero and the link silently fails to come up (see lora-ping for the full rationale).
 const TX_BOOST: bool = true;
 
+// Self-heal threshold: after this many consecutive cycles with no valid Telemetry reply, hardware-re-init the radio
+// (RESET pulse + cold start) instead of looping forever. This is the actual cure for the PA-death failure where the
+// goggle's TX-done IRQ keeps firing but the power stage has latched off — a reset re-arms it without a reboot. At the
+// 40 ms cadence, 8 misses is ~320 ms of silence, well below any human-noticeable head-tracking stall. TODO: tune.
+const REINIT_AFTER_MISSES: u32 = 8;
+
+// Back-off threshold once Disconnected: after the first re-init fails to bring the truck back, we can't tell "my PA
+// is dead" from "the truck is simply off/out of range", so retry slowly (75 * 40 ms = ~3 s) instead of RESET-pulsing
+// every ~320 ms forever. Drops to the fast REINIT_AFTER_MISSES again the moment a real reply re-marks us Connected.
+const REINIT_BACKOFF_MISSES: u32 = 75;
+
+// LoRa binding: phrase -> UID -> link-id + CRC initializer, derived at compile time from BINDING_PHRASE (defaulted in
+// build.rs). Both nodes must build with the same phrase; every TX frame is tagged + CRC'd so the truck drops frames
+// from a differently bound pair, and we drop theirs — ExpressLRS-style anti-collision on a shared frequency.
+const BINDING: link_id::Binding = link_id::derive(env!("BINDING_PHRASE"));
+
 // OLED refresh cadence. The panel only shows a human-readable glance, so a few Hz is plenty.
 const OLED_PERIOD: Duration = Duration::from_millis(250);
 
@@ -105,6 +121,9 @@ static SPEED: Signal<CriticalSectionRawMutex, Telemetry> = Signal::new();
 // Lap-reset edge from the button, consumed by the OLED task to reset its placeholder lap timer. The unit payload
 // is just an event marker — the OLED re-bases its elapsed-time origin when it fires.
 static LAP_RESET: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+// Latest LoRa link state (Connected/Tentative/Disconnected) published by the LoRa task on each change. Surfaced for
+// the status display; the OLED task does not consume it yet (the UI is being reworked) — it is here so it can.
+static LINK_STATE: Signal<CriticalSectionRawMutex, lora_link::LinkState> = Signal::new();
 
 // The radio type lives in `nrf_adapters::lora` now (shared by both nodes + lora-ping so it can never drift); the
 // spawned LoRa task takes `nrf_adapters::lora::Link` directly for its non-generic signature.
@@ -225,6 +244,11 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
   // Until the first PPM frame, send center so the truck has a defined pose.
   let mut latest = Control { pan_us: CENTER_US, tilt_us: CENTER_US };
   let mut rx_buf = [0u8; lora_link::MAX_PAYLOAD as usize];
+  // Owns the self-heal: counts reply-misses, re-inits the radio at the threshold, then backs off while Disconnected.
+  let mut health = lora_link::LinkHealth::new(REINIT_AFTER_MISSES, REINIT_BACKOFF_MISSES);
+  // Last published link state, so we only signal LINK_STATE on a change rather than every 40 ms tick.
+  let mut last_state = health.state();
+  LINK_STATE.signal(last_state);
 
   loop {
     ticker.next().await;
@@ -235,7 +259,8 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
       latest = control;
     }
 
-    // Encode the Control into a heapless Vec<u8, 12> (covers any two-uint32 message), then transmit. micropb's
+    // Encode the Control into a heapless Vec<u8, 12> (covers any two-uint32 message), then wrap it with the binding
+    // frame ([link_id][proto][crc16], +4 bytes) so the truck only accepts frames from our pair. micropb's
     // container-heapless-0-9 implements PbWrite for exactly this heapless 0.9 Vec.
     let mut enc = PbEncoder::new(heapless::Vec::<u8, 12>::new());
     if latest.encode(&mut enc).is_err() {
@@ -243,38 +268,58 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
       continue;
     }
     let payload = enc.into_writer();
-    // Bounded TX: a never-completing send (missed DIO0 TX-done, likely GPIOTE contention with the PPM edge waits)
-    // would otherwise hang the whole transmit loop forever. On a timeout, drop this cycle and re-prepare the radio
-    // next tick so the link self-heals instead of dying until a reboot.
-    match select(link.send(&payload, TX_POWER_DBM), Timer::after(TX_TIMEOUT)).await {
-      Either::First(Ok(())) => {}
-      Either::First(Err(e)) => {
-        applog::log_println!("LoRa TX error: {:?}", e);
-        continue;
-      }
-      Either::Second(()) => {
-        applog::log_println!("LoRa TX timed out (no TX-done) — recovering");
-        continue;
-      }
+    let mut framed = heapless::Vec::<u8, 16>::new();
+    if link_id::frame(&BINDING, &payload, &mut framed).is_err() {
+      applog::log_println!("control frame overflow");
+      continue;
     }
 
-    // Listen for the truck's Telemetry reply, bounded by REPLY_TIMEOUT so a lost reply cannot stall the loop.
-    match select(link.receive(&mut rx_buf), Timer::after(REPLY_TIMEOUT)).await {
-      Either::First(Ok(len)) => {
-        let mut telem = Telemetry::default();
-        if telem.decode_from_bytes(&rx_buf[..len]).is_ok() {
-          // km/h = cm_s * 36 / 1000, integer rounded — logged here for the serial console; the freshest telemetry
-          // is also handed to the OLED. speed_cm_s is an externally-controllable uint32, so widen to u64 first so
-          // the product can never wrap (review fix #3).
-          let kmh = ((telem.speed_cm_s as u64 * 36 + 500) / 1000) as u32;
-          applog::log_println!("telemetry: {} km/h | sats {} | fix {}", kmh, telem.sats, telem.fix_quality);
-          SPEED.signal(telem);
-        } else {
-          applog::log_println!("telemetry decode failed ({} bytes)", len);
+    // One TX + reply round-trip. `got_reply` is set only when a valid Telemetry frame from our pair decodes; any
+    // other outcome (TX error/timeout, RX error/timeout, foreign frame) counts as a miss toward the self-heal.
+    let mut got_reply = false;
+    // Bounded TX: a never-completing send (missed DIO0 TX-done, likely GPIOTE contention with the PPM edge waits)
+    // would otherwise hang the transmit loop forever. On error/timeout we fall through to the miss accounting below.
+    match select(link.send(&framed, TX_POWER_DBM), Timer::after(TX_TIMEOUT)).await {
+      Either::First(Ok(())) => {
+        // Listen for the truck's Telemetry reply, bounded by REPLY_TIMEOUT so a lost reply cannot stall the loop.
+        match select(link.receive(&mut rx_buf), Timer::after(REPLY_TIMEOUT)).await {
+          Either::First(Ok(len)) => {
+            if let Some(bytes) = link_id::deframe(&BINDING, &rx_buf[..len]) {
+              let mut telem = Telemetry::default();
+              if telem.decode_from_bytes(bytes).is_ok() {
+                // km/h = cm_s * 36 / 1000, integer rounded — logged for the serial console; the freshest telemetry
+                // is also handed to the OLED. speed_cm_s is an externally-controllable uint32, so widen to u64
+                // first so the product can never wrap (review fix #3).
+                let kmh = ((telem.speed_cm_s as u64 * 36 + 500) / 1000) as u32;
+                applog::log_println!("telemetry: {} km/h | sats {} | fix {}", kmh, telem.sats, telem.fix_quality);
+                SPEED.signal(telem);
+                got_reply = true;
+              } else {
+                applog::log_println!("telemetry decode failed ({} bytes)", bytes.len());
+              }
+            }
+            // A frame that fails deframe is another pair's traffic (or noise) — not our reply, so leave got_reply false.
+          }
+          Either::First(Err(e)) => applog::log_println!("LoRa RX error: {:?}", e),
+          Either::Second(()) => { /* no reply this cycle — expected occasionally. */ }
         }
       }
-      Either::First(Err(e)) => applog::log_println!("LoRa RX error: {:?}", e),
-      Either::Second(()) => { /* no reply this cycle — expected occasionally, just move on. */ }
+      Either::First(Err(e)) => applog::log_println!("LoRa TX error: {:?}", e),
+      Either::Second(()) => applog::log_println!("LoRa TX timed out (no TX-done) — recovering"),
+    }
+
+    // Self-heal: feed this cycle's result to LinkHealth, which clears the streak on a good reply or, after enough
+    // misses, re-inits the radio to clear a latched PA fault — the fix for "link dies, only a reboot recovers".
+    match health.service(Some(got_reply), &mut link).await {
+      lora_link::Serviced::Reinited(Ok(())) => applog::log_println!("radio re-init OK"),
+      lora_link::Serviced::Reinited(Err(e)) => applog::log_println!("radio re-init failed: {:?}", e),
+      lora_link::Serviced::Idle => {}
+    }
+    // Publish link state for the status display only when it changes (the OLED does not consume it yet).
+    let state = health.state();
+    if state != last_state {
+      last_state = state;
+      LINK_STATE.signal(state);
     }
   }
 }

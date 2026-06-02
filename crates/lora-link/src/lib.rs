@@ -92,6 +92,15 @@ where
     self.lora.sleep(warm_start).await
   }
 
+  /// Hardware-re-initializes the radio: lora-phy's `init()` pulses the RESET pin low→high, then re-runs cold
+  /// start (re-writes the modulation/PA registers). This clears a *latched* PA over-current/thermal fault — the
+  /// "TX-done IRQ still fires but no RF radiates" failure that otherwise needs a full power cycle — so a stalled
+  /// link self-heals in place instead of dying until a reboot. The pre-built modulation/TX/RX `PacketParams` are
+  /// value structs independent of chip state, so they stay valid and the send/receive hot path needs no rebuild.
+  pub async fn reinit(&mut self) -> Result<(), RadioError> {
+    self.lora.init().await
+  }
+
   /// Borrows the underlying lora-phy radio for advanced use (e.g. custom modulation experiments).
   pub fn radio(&mut self) -> &mut LoRa<RK, DLY> {
     &mut self.lora
@@ -129,4 +138,98 @@ where
   // `false` = P2P, not a public LoRaWAN network.
   let lora = LoRa::new(Sx127x::new(spi, iv, config), false, delay).await?;
   LoraLink::new(lora)
+}
+
+/// Coarse connection state for a P2P link, shared by both nodes so they reason about liveness identically.
+/// `Tentative` is the in-between after a miss but before the re-init threshold; `Disconnected` is entered right
+/// after a re-init, until a real packet proves the link is back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LinkState {
+  Disconnected,
+  Tentative,
+  Connected,
+}
+
+/// Tracks link health and owns the full self-heal policy — the ExpressLRS-style "keep listening and re-arm rather
+/// than latch into a dead state" recovery, centralized here so the goggle (reply-timeout driven) and the truck
+/// (RX-silence driven) share one codepath instead of duplicating the count/re-init/back-off logic. Feed each
+/// cycle's outcome to [`service`](Self::service); it counts misses, hardware-re-inits the radio at the threshold,
+/// and drives [`state`](Self::state) (which a UI can surface). Holds no timers — the back-off is purely count-based.
+pub struct LinkHealth {
+  state: LinkState,
+  consecutive_misses: u32,
+  // Misses before a re-init while the link is still freshly degraded (was Connected). The fast, first attempt.
+  reinit_after: u32,
+  // Larger threshold once Disconnected (a prior re-init didn't bring the peer back). Retries a likely-absent peer
+  // slowly instead of hammering RESET every `reinit_after` cycles — at the node's loop rate this sets the back-off.
+  reinit_after_disconnected: u32,
+}
+
+/// What [`LinkHealth::service`] did this cycle, so the caller can log it (keeping `lora-link` logger-agnostic).
+pub enum Serviced {
+  /// No re-init this cycle (healthy, below threshold, or a neutral outcome). Nothing to log.
+  Idle,
+  /// A re-init fired at the threshold; carries lora-phy's result for the caller to log.
+  Reinited(Result<(), RadioError>),
+}
+
+impl LinkHealth {
+  /// Builds a tracker that re-inits after `reinit_after` consecutive misses while freshly degraded, then backs off
+  /// to `reinit_after_disconnected` misses between re-inits once `Disconnected`. Starts `Disconnected` (the link
+  /// must hear a real packet before it reads `Connected`).
+  pub const fn new(reinit_after: u32, reinit_after_disconnected: u32) -> Self {
+    Self { state: LinkState::Disconnected, consecutive_misses: 0, reinit_after, reinit_after_disconnected }
+  }
+
+  /// Current coarse link state — `Connected` / `Tentative` / `Disconnected`. Surfaced for a status display.
+  pub fn state(&self) -> LinkState {
+    self.state
+  }
+
+  /// Misses before a re-init fires, given the current state: the back-off `reinit_after_disconnected` once we're
+  /// already `Disconnected`, otherwise the fast `reinit_after`.
+  fn threshold(&self) -> u32 {
+    match self.state {
+      LinkState::Disconnected => self.reinit_after_disconnected,
+      _ => self.reinit_after,
+    }
+  }
+
+  /// Folds one cycle's `outcome` into the health state and re-inits `link` if the miss streak hits the (state-
+  /// dependent) threshold. `outcome`:
+  ///   - `Some(true)`  — a clean round-trip: clears the streak, marks `Connected`.
+  ///   - `Some(false)` — a fault a radio reset could fix (RX silence, RX/TX error, reply-TX stall): counts a miss.
+  ///   - `None`        — neutral (e.g. a foreign pair's frame): the radio path works, so leave the streak untouched.
+  /// Returns [`Serviced`] so the caller logs the re-init outcome. After a re-init the link drops to `Disconnected`,
+  /// so the *next* re-init waits the longer back-off threshold — a permanently-absent peer is retried slowly.
+  pub async fn service<RK, DLY>(&mut self, outcome: Option<bool>, link: &mut LoraLink<RK, DLY>) -> Serviced
+  where
+    RK: RadioKind,
+    DLY: DelayNs,
+  {
+    match outcome {
+      Some(true) => {
+        self.consecutive_misses = 0;
+        self.state = LinkState::Connected;
+        Serviced::Idle
+      }
+      None => Serviced::Idle,
+      Some(false) => {
+        self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+        if self.state == LinkState::Connected {
+          self.state = LinkState::Tentative;
+        }
+        if self.consecutive_misses >= self.threshold() {
+          let result = link.reinit().await;
+          // Clear the streak and drop to Disconnected so the link must re-prove itself and the next re-init waits
+          // the back-off threshold rather than firing again one fast window later.
+          self.consecutive_misses = 0;
+          self.state = LinkState::Disconnected;
+          Serviced::Reinited(result)
+        } else {
+          Serviced::Idle
+        }
+      }
+    }
+  }
 }

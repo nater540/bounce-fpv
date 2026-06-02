@@ -18,4 +18,13 @@ fn main() {
   // Re-run if the layout changes so a memory.x edit during on-target confirmation is picked up.
   println!("cargo:rerun-if-changed={}", memory_x.display());
   println!("cargo:rerun-if-changed=build.rs");
+
+  // LoRa binding phrase (link-id): the firmware reads env!("BINDING_PHRASE") at compile time to derive its UID +
+  // link-id + CRC filter. Provide a default here so a plain `cargo build` works; an explicit shell-exported
+  // BINDING_PHRASE is forwarded straight to rustc and takes precedence (we only emit the default when it is unset).
+  // The goggle and truck MUST build with the SAME phrase to talk — flash two pairs with BINDING_PHRASE="pair-a"/"pair-b".
+  println!("cargo:rerun-if-env-changed=BINDING_PHRASE");
+  if env::var("BINDING_PHRASE").is_err() {
+    println!("cargo:rustc-env=BINDING_PHRASE=fabulous-default");
+  }
 }

@@ -98,7 +98,7 @@ macro_rules! role_accessors {
 pub struct BoardPins {
   /// PPM input from the goggles' HT OUT jack (goggle node). Drive as `Input` + a GPIOTE edge wait.
   pub ppm: PpmPin,
-  /// Lap-reset push button (truck node). Active-low to GND with internal pull-up; GPIOTE edge wait.
+  /// Re-home / lap-reset push button (goggle node). Active-low to GND with internal pull-up; GPIOTE edge wait.
   pub button: ButtonPin,
   /// Servo PWM outputs (truck node): pan / tilt, two channels of one `SimplePwm` on a shared 50 Hz frame.
   /// Drive the MG90S from a separate 5 V rail with common ground, never the 3.3 V pin.

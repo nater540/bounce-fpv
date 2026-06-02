@@ -1,4 +1,4 @@
-# Technical Reference: Rust + Embassy FPV Head-Tracking Camera System for RC Trucks
+# Bounce FPV — Technical Reference: Rust + Embassy FPV Head-Tracking Camera System for RC Trucks
 
 > **PLATFORM MIGRATED — read `docs/01-nrf52840-migration.md` first.** The project moved off the ESP32-C6 / esp-hal path onto the **nRF52840 (Nice!Nano v2)**. The *application architecture* below (tasks, LoRa link, PPM decode, control flow, the frozen driver crates) still holds, but every **toolchain, HAL, pin-map, SoftDevice, USB-CDC, and flashing** detail in this doc is obsolete — see `01-nrf52840-migration.md` for the validated platform, version matrix, and flashing workflow.
 

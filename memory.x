@@ -4,7 +4,7 @@
 /* Flash map (low -> high):
      0x00000000  MBR (Nordic master boot record, 4 KB)
      0x00001000  s140 SoftDevice
-     0x00027000  APPLICATION  <- our firmware (FLASH ORIGIN below)
+     0x00026000  APPLICATION  <- our firmware (FLASH ORIGIN below)
      0x000F4000  Adafruit UF2 bootloader + its config/settings region, up to the 1 MB top
 
    FLASH ORIGIN: CONFIRMED on-target from the Nice!Nano INFO_UF2.TXT — the resident SoftDevice is s140

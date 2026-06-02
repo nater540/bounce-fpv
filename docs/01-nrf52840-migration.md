@@ -1,4 +1,4 @@
-# nRF52840 Migration Reference (supersedes the ESP32-C6 platform in `00-overview.md`)
+# Bounce FPV — nRF52840 Migration Reference (supersedes the ESP32-C6 platform in `00-overview.md`)
 
 The project moved off the ESP32-C6 / esp-hal path onto the **nRF52840** (a different MCU family) because the
 XIAO ESP32-C6 broke out too few GPIO for the peripheral-heavy truck, and because the user wants BLE

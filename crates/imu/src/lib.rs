@@ -34,16 +34,16 @@ pub const DEFAULT_SAMPLES: u16 = 100;
 /// Spacing between samples, in milliseconds (100 samples * 5 ms = ~0.5 s of averaging).
 pub const SAMPLE_INTERVAL_MS: u32 = 5;
 
-/// The boot home reference: the average resting roll and pitch in degrees. The servo loop treats this as the
-/// gimbal center, so a tilted mounting is calibrated out automatically.
+/// The boot home reference: the average resting roll and pitch in degrees.
+/// The servo loop treats this as the gimbal center, so a tilted mounting is calibrated out automatically.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct Home {
   pub roll_deg: f32,
   pub pitch_deg: f32,
 }
 
-/// Errors from home detection: either driver init failed, or a sample read failed. The driver's own error
-/// type is generic over the I2C error, so we keep this enum minimal and `Debug`-only.
+/// Errors from home detection: either driver init failed, or a sample read failed.
+/// The driver's own error type is generic over the I2C error, so we keep this enum minimal and `Debug`-only.
 #[derive(Debug)]
 pub enum HomeError {
   /// `Mpu6050::new` could not bring the device out of sleep (bad wiring / wrong address).
@@ -52,8 +52,8 @@ pub enum HomeError {
   Read,
 }
 
-/// Computes roll and pitch (degrees) from a raw accel sample. Scale cancels in the ratios, so raw counts are
-/// fine. `roll = atan2(ay, az)`, `pitch = atan2(-ax, hypot(ay, az))`.
+/// Computes roll and pitch (degrees) from a raw accel sample.
+/// Scale cancels in the ratios, so raw counts are fine. `roll = atan2(ay, az)`, `pitch = atan2(-ax, hypot(ay, az))`.
 pub fn roll_pitch_from_accel(ax: i16, ay: i16, az: i16) -> (f32, f32) {
   let (ax, ay, az) = (ax as f32, ay as f32, az as f32);
   let roll = libm::atan2f(ay, az);

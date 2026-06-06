@@ -3,12 +3,10 @@ name = "imu"
 version.workspace = true
 edition.workspace = true
 
-# MPU-6050 home/center detection over mpu6050-dmp (async). Generic over an embedded-hal-async I2C; takes N
-# accel samples at boot, averages accel-derived roll/pitch, and stores them as the gimbal home reference.
+# MPU-6050 home/center detection over mpu6050-dmp (async). Generic over an embedded-hal-async I2C; takes _N_ accel samples at boot,
+# averages accel-derived roll/pitch, and stores them as the gimbal home reference.
 #
 # NOTE: mpu6050-dmp's async driver (`sensor_async`) is enabled via its `async` feature on the workspace pin.
-# esp-hal's async I2C implements the embedded-hal-async 1.0 `I2c` trait this driver binds to. libm supplies
-# atan2f/sqrtf for the boot accel-to-roll/pitch home calc.
 [dependencies]
 mpu6050-dmp = { workspace = true }
 embedded-hal-async = { workspace = true }

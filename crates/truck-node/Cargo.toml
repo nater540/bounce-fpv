@@ -15,7 +15,9 @@ board = { workspace = true }
 servo = { workspace = true }
 lora-link = { workspace = true }
 link-id = { workspace = true }
-imu = { workspace = true }
+# Optional: the boot IMU home read (gimbal level-trim) is gated behind the default-on `imu` feature below, so a
+# truck with a square mechanical mount can drop it entirely. See [features].
+imu = { workspace = true, optional = true }
 gps = { workspace = true }
 # Pure nav math: the truck owns the home point, so it computes distance + bearing here and ships only those.
 geo = { workspace = true }
@@ -37,3 +39,11 @@ embedded-hal-async = { workspace = true }
 static_cell = { workspace = true }
 heapless = { workspace = true }
 micropb = { workspace = true }
+
+# The boot IMU home read (gimbal level-trim) is optional. With `imu` ON (default) the truck reads the MPU-6050 at
+# boot and trims the gimbal center for a tilted mount — it must be held still during the ~2 s settle+average. With
+# `imu` OFF the read is skipped entirely (no still-at-power-on requirement) and the gimbal centers on the pure servo
+# neutral; build that variant with `--no-default-features`. Default-on keeps every existing build identical.
+[features]
+default = ["imu"]
+imu = ["dep:imu"]

@@ -3,12 +3,14 @@ name = "truck-diag"
 version.workspace = true
 edition.workspace = true
 
-# Truck-node peripheral bring-up diagnostics (Phase C: nRF52840). ONE crate, FOUR binaries under src/bin/ (cargo
-# auto-discovers them): `servo`, `imu`, `oled`, `gps`. Each exercises ONE peripheral in ISOLATION so it can be flashed
-# and validated on hardware before the integrated truck-node run — flash one at a time, e.g.
-# `cargo run --release -p truck-diag --bin servo`. The shared #[panic_handler] now lives in `applog` (each bin pulls
-# it in via `use applog as _;`); src/lib.rs is an empty placeholder keeping the crate layout. Thin: all real logic
-# lives in the servo / imu / display / gps driver crates + the nrf-adapters bridges; these bins just observe hardware.
+# Truck-node peripheral bring-up diagnostics (Phase C: nRF52840). ONE crate, FIVE binaries under src/bin/ (cargo
+# auto-discovers them): `servo`, `imu`, `oled`, `gps`, and `demo`. The first four each exercise ONE peripheral in
+# ISOLATION so it can be flashed and validated on hardware before the integrated truck-node run — flash one at a time,
+# e.g. `cargo run --release -p truck-diag --bin servo`. `demo` is the odd one out: a no-LoRa/GPS/IMU "movie mode" that
+# drives the production T1 OLED layout + both servos from synthetic data to show motion and measure panel render speed.
+# The shared #[panic_handler] now lives in `applog` (each bin pulls it in via `use applog as _;`); src/lib.rs is an
+# empty placeholder keeping the crate layout. Thin: all real logic lives in the servo / imu / display / gps driver
+# crates + the nrf-adapters bridges; these bins just observe hardware.
 [dependencies]
 board = { workspace = true }
 applog = { workspace = true }

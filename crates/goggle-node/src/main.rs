@@ -289,6 +289,9 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
   let mut rehome_pending: u8 = 0;
   // Owns the self-heal: counts reply-misses, re-inits the radio at the threshold, then backs off while Disconnected.
   let mut health = lora_link::LinkHealth::new(REINIT_AFTER_MISSES, REINIT_BACKOFF_MISSES);
+  // Running count of self-heal radio re-inits, logged with uptime so an overnight soak shows how often the link
+  // drops and that each one recovered (normal telemetry logging resuming after is the proof of recovery).
+  let mut reinit_count: u32 = 0;
   // Last published link state, so we only signal LINK_STATE on a change rather than every 40 ms tick.
   let mut last_state = health.state();
   LINK_STATE.signal(last_state);
@@ -376,8 +379,15 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
     // Self-heal: feed this cycle's result to LinkHealth, which clears the streak on a good reply or, after enough
     // misses, re-inits the radio to clear a latched PA fault — the fix for "link dies, only a reboot recovers".
     match health.service(Some(got_reply), &mut link).await {
-      lora_link::Serviced::Reinited(Ok(())) => applog::log_println!("radio re-init OK"),
-      lora_link::Serviced::Reinited(Err(e)) => applog::log_println!("radio re-init failed: {:?}", e),
+      lora_link::Serviced::Reinited(result) => {
+        reinit_count += 1;
+        let up = Instant::now().as_secs();
+        let (h, m, s) = (up / 3600, (up % 3600) / 60, up % 60);
+        match result {
+          Ok(()) => applog::log_println!("radio re-init OK (#{}, up {}h{:02}m{:02}s)", reinit_count, h, m, s),
+          Err(e) => applog::log_println!("radio re-init failed: {:?} (#{}, up {}h{:02}m{:02}s)", e, reinit_count, h, m, s),
+        }
+      }
       lora_link::Serviced::Idle => {}
     }
     // Publish link state for the status display only when it changes (the OLED does not consume it yet).

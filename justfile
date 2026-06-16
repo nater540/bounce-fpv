@@ -18,7 +18,7 @@ default:
 
 # Build a binary for the nRF target by its bin name (default: the Phase A spike). `--bin` works workspace-wide
 # now that Phase B1 removed the esp crates (the critical-section feature collision is gone), so multi-bin
-# crates resolve too: `just flash servo` / `imu` / `oled` / `gps` pick truck-diag's bins by name.
+# crates resolve too: `just flash servo` / `imu` / `oled` / `gps` / `demo` pick truck-diag's bins by name.
 build bin="nrf-spike" features="":
   cargo build --release --bin {{bin}} {{ if features != "" { "--features " + features } else { "" } }}
 

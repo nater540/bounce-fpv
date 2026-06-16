@@ -5,8 +5,9 @@
 //!
 //! Tasks and latest-value `Signal` hand-offs (all lossy — control loops act on the freshest sample, never a
 //! queue):
-//!   - startup one-shot (in `main`) — builds the MPU-6050 `Twim` and runs `imu::detect_home_default` to
-//!     establish the gimbal center reference BEFORE the servo loop starts, then passes it into `servo_task`.
+//!   - startup one-shot (in `main`, behind the default-on `imu` feature) — builds the MPU-6050 `Twim` and runs
+//!     `imu::detect_home_default` to establish the gimbal center trim BEFORE the servo loop starts, passing it as
+//!     pan/tilt trims into `servo_task`. With the `imu` feature off the read is skipped and the trims are zero.
 //!   - `lora_task`  — RX a `Control`, decode; on success `CONTROL.signal(..)`, on decode failure `continue`
 //!     (never replies to garbage); then read the latest GPS `Telemetry` and TX it as the turnaround reply.
 //!   - `servo_task` — builds the two 50 Hz `SimplePwm` outputs (PWM0 pan, PWM1 tilt), wraps each in
@@ -38,7 +39,7 @@ use embassy_nrf::uarte::{self, Baudrate};
 use embassy_nrf::{bind_interrupts, peripherals};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
+use embassy_time::{Duration, Instant, Ticker, Timer};
 use gps::GpsReader;
 use micropb::{MessageDecode, MessageEncode, PbEncoder};
 use nrf_adapters::PwmServoChannel;
@@ -61,6 +62,7 @@ const SERVO_PERIOD: Duration = Duration::from_millis(20);
 
 // Pulse-width change per degree of IMU home tilt, used to trim the gimbal center for a tilted mount. Derived
 // from the MG90S ~400-2400 us / ~180 deg span ((2400-400)/180 ~= 11 us/deg). TODO: calibrate on hardware.
+#[cfg(feature = "imu")]
 const US_PER_DEGREE: i32 = 11;
 
 // Loss-of-signal failsafe window: if no fresh Control arrives within this span the servo loop recenters the
@@ -71,6 +73,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_millis(1000);
 // Plausible mount-tilt bound for the boot IMU home angle. A present-but-garbage MPU-6050 that ACKs returns bogus
 // accel, which would otherwise bake a large permanent center bias into the trim; an angle beyond this is treated
 // as zero trim (calibration suspect). TODO: tune on hardware.
+#[cfg(feature = "imu")]
 const MAX_HOME_DEG: f32 = 30.0;
 
 // GPS UART baud. Most modules default to 9600. TODO: confirm against the specific receiver.
@@ -168,31 +171,46 @@ async fn main(spawner: Spawner) {
   applog::log_println!("");
   applog::log_println!("=== truck-node: LoRa RX -> servos + IMU + GPS (nRF52840, headless) ===");
 
-  // Startup one-shot: establish the gimbal home from the IMU's resting orientation BEFORE the servo loop runs.
-  // The MPU-6050 is the only I2C device on this node, so it gets a direct Twim (no shared bus). The TWIM
-  // tx_ram_buffer must be 'static (it outlives the 'static peripheral); a StaticCell gives it that, and 16 bytes
-  // is ample for the small command bytes the driver sends.
+  // Shared I2C bus (TWISPI0). The status OLED ALWAYS needs it; the MPU-6050 (optional `imu` feature) is the only
+  // other device, so a direct Twim suffices — no shared_bus Mutex. The TWIM tx_ram_buffer must be 'static (it
+  // outlives the 'static peripheral); a StaticCell gives it that, and 16 bytes is ample for the small command
+  // bytes either driver sends. Enable the internal SDA/SCL pull-ups (Config::default enables NEITHER) so the bus
+  // ACKs on bare wiring — the same fix that brought I2C up in lora-ping (both flags set; embassy-nrf gates both
+  // lines off sda_pullup). The OLED takes ownership at the bottom of main; with `imu` OFF nothing mutates the bus
+  // in main before then, hence the conditional allow(unused_mut).
   static TWIM_TX_BUF: StaticCell<[u8; 16]> = StaticCell::new();
   let tx_buf = TWIM_TX_BUF.init([0; 16]);
-  // Enable the internal SDA/SCL pull-ups (Config::default enables NEITHER) so the MPU-6050 ACKs on bare wiring —
-  // the same fix that brought I2C up in lora-ping. Both flags set (embassy-nrf gates both lines off sda_pullup).
-  let mut imu_i2c_cfg = twim::Config::default();
-  imu_i2c_cfg.sda_pullup = true;
-  imu_i2c_cfg.scl_pullup = true;
-  let mut i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, imu_i2c_cfg, tx_buf);
-  let mut delay = Delay;
-  // Resolve the boot home so the servo loop can trim the gimbal center for a tilted mount. Home is Copy, so it is
-  // passed by value into servo_task below.
-  let home = match imu::detect_home_default(&mut i2c, &mut delay).await {
-    Ok(home) => {
-      applog::log_println!("IMU home: roll {} deg, pitch {} deg", home.roll_deg, home.pitch_deg);
-      home
-    }
-    // A missing/miswired IMU must not brick the truck; log and fall back to a zero trim (fixed center).
-    Err(e) => {
-      applog::log_println!("IMU home detection failed ({:?}) — using fixed center", e);
-      imu::Home::default()
-    }
+  let mut i2c_cfg = twim::Config::default();
+  i2c_cfg.sda_pullup = true;
+  i2c_cfg.scl_pullup = true;
+  #[cfg_attr(not(feature = "imu"), allow(unused_mut))]
+  let mut i2c = Twim::new(p.TWISPI0, Irqs, pins.i2c_sda, pins.i2c_scl, i2c_cfg, tx_buf);
+
+  // Boot IMU home -> gimbal center trim (pan from roll, tilt from pitch), passed into servo_task. Behind the
+  // default-on `imu` feature: with it ON the MPU-6050 is read once BEFORE the servo loop starts so a tilted mount is
+  // calibrated out; the truck must be held still during the ~2 s settle+average. With it OFF the read is skipped
+  // entirely — no still-at-power-on requirement — and the trims are zero, so the gimbal centers on the pure servo
+  // neutral. Either branch yields the same (pan_trim, tilt_trim) so the spawn below is feature-agnostic.
+  #[cfg(feature = "imu")]
+  let (pan_trim, tilt_trim) = {
+    let mut delay = embassy_time::Delay;
+    let home = match imu::detect_home_default(&mut i2c, &mut delay).await {
+      Ok(home) => {
+        applog::log_println!("IMU home: roll {} deg, pitch {} deg", home.roll_deg, home.pitch_deg);
+        home
+      }
+      // A missing/miswired IMU must not brick the truck; log and fall back to a zero trim (fixed center).
+      Err(e) => {
+        applog::log_println!("IMU home detection failed ({:?}) — using fixed center", e);
+        imu::Home::default()
+      }
+    };
+    (bounded_home_trim(home.roll_deg, "roll"), bounded_home_trim(home.pitch_deg, "pitch"))
+  };
+  #[cfg(not(feature = "imu"))]
+  let (pan_trim, tilt_trim): (i32, i32) = {
+    applog::log_println!("IMU disabled (build without the `imu` feature) — fixed gimbal center, no boot home read");
+    (0, 0)
   };
 
   // Build the SX1276/RFM95W link via the shared nrf-adapters helper (Spim on SPI3 + NSS/RESET Outputs + DIO0 Input
@@ -244,10 +262,11 @@ async fn main(spawner: Spawner) {
 
   // The task macro returns a Result<SpawnToken, SpawnError> (the pool-full case); unwrap the token then spawn.
   spawner.spawn(lora_task(link).expect("lora_task token"));
-  spawner.spawn(servo_task(pan_pwm, tilt_pwm, home).expect("servo_task token"));
+  spawner.spawn(servo_task(pan_pwm, tilt_pwm, pan_trim, tilt_trim).expect("servo_task token"));
   spawner.spawn(gps_task(GpsReader::new(gps_rx)).expect("gps_task token"));
-  // The one-shot boot IMU read above already released its &mut borrow of the bus, so the Twim is free — hand it to
-  // the status OLED task, which shows the received pan/tilt (no shared_bus needed; the IMU is not read at runtime).
+  // The Twim is free now — with `imu` on, the one-shot boot read above already released its &mut borrow; with it off
+  // nothing touched the bus. Hand it to the status OLED task, which shows the received pan/tilt (no shared_bus
+  // needed; the IMU, when present, is not read at runtime).
   spawner.spawn(oled_task(i2c).expect("oled_task token"));
 }
 
@@ -261,6 +280,9 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
   let mut telem = Telemetry::default();
   // Owns the self-heal: counts radio-fault windows, re-inits at the threshold, then backs off while Disconnected.
   let mut health = lora_link::LinkHealth::new(REINIT_AFTER_MISSES, REINIT_BACKOFF_MISSES);
+  // Running count of self-heal radio re-inits, logged with uptime so an overnight soak shows how often the link
+  // drops and that each one recovered (normal telemetry logging resuming after is the proof of recovery).
+  let mut reinit_count: u32 = 0;
   // Last published link state, so we only signal LINK_STATE on a change rather than every RX window.
   let mut last_state = health.state();
   LINK_STATE.signal(last_state);
@@ -352,8 +374,15 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
     // Self-heal: LinkHealth folds the outcome (Some(true)=clean, Some(false)=radio fault, None=foreign/neutral),
     // re-inits the radio past the threshold to clear a stuck RX/TX stage, and backs off once Disconnected.
     match health.service(outcome, &mut link).await {
-      lora_link::Serviced::Reinited(Ok(())) => applog::log_println!("radio re-init OK"),
-      lora_link::Serviced::Reinited(Err(e)) => applog::log_println!("radio re-init failed: {:?}", e),
+      lora_link::Serviced::Reinited(result) => {
+        reinit_count += 1;
+        let up = Instant::now().as_secs();
+        let (h, m, s) = (up / 3600, (up % 3600) / 60, up % 60);
+        match result {
+          Ok(()) => applog::log_println!("radio re-init OK (#{}, up {}h{:02}m{:02}s)", reinit_count, h, m, s),
+          Err(e) => applog::log_println!("radio re-init failed: {:?} (#{}, up {}h{:02}m{:02}s)", e, reinit_count, h, m, s),
+        }
+      }
       lora_link::Serviced::Idle => {}
     }
     // Publish link state for the status display only when it changes (the OLED does not consume it yet).
@@ -367,7 +396,8 @@ async fn lora_task(mut link: nrf_adapters::lora::Link) {
 
 /// Rounds an f32 to the nearest i32 using only `*`/`+` and the truncating `as i32` cast — no libm, so this is
 /// usable in no_std without pulling a float-math dependency into the binary. Bias toward the value's own sign so
-/// negative trims round symmetrically (e.g. -1.5 -> -2, 1.5 -> 2).
+/// negative trims round symmetrically (e.g. -1.5 -> -2, 1.5 -> 2). IMU-home trim only, hence feature-gated.
+#[cfg(feature = "imu")]
 fn round_to_i32(v: f32) -> i32 {
   if v >= 0.0 { (v + 0.5) as i32 } else { (v - 0.5) as i32 }
 }
@@ -377,19 +407,15 @@ fn round_to_i32(v: f32) -> i32 {
 /// pose actually changed (new Control, failsafe recenter, or the first tick), since the PWM holds its duty. On a
 /// loss of signal (no fresh Control within `CONTROL_TIMEOUT`) it recenters the gimbal. Never blocks on the radio.
 #[embassy_executor::task]
-async fn servo_task(pan_pwm: SimplePwm<'static>, tilt_pwm: SimplePwm<'static>, home: imu::Home) {
+async fn servo_task(pan_pwm: SimplePwm<'static>, tilt_pwm: SimplePwm<'static>, pan_trim: i32, tilt_trim: i32) {
   // PwmServoChannel adapts each SimplePwm channel 0 to embedded_hal::pwm::SetDutyCycle; Servo caches its max_duty
   // (20_000, so 1 tick = 1 us) and converts us -> duty for us.
   let mut pan_servo = Servo::new(PwmServoChannel::new(pan_pwm, 0));
   let mut tilt_servo = Servo::new(PwmServoChannel::new(tilt_pwm, 0));
 
-  // Center trim from the IMU boot home: a tilted mount shifts the gimbal center so head-tracking pivots about
-  // level. roll trims pan, pitch trims tilt. Bound each angle first: a present-but-garbage MPU-6050 that ACKs
-  // returns bogus accel, which would bake a large permanent center bias into the trim; an angle beyond
-  // MAX_HOME_DEG is treated as zero trim (boot calibration suspect) and logged. f32 `as i32` truncates toward
-  // zero (and needs no libm), so round_to_i32 biases by +/-0.5 first. TODO: calibrate sign/scale on hardware.
-  let pan_trim = bounded_home_trim(home.roll_deg, "roll");
-  let tilt_trim = bounded_home_trim(home.pitch_deg, "pitch");
+  // Center trim from the boot IMU home (pan from roll, tilt from pitch), already bounded + converted to us in main
+  // — or zero when the `imu` feature is off. A tilted mount shifts the gimbal center so head-tracking pivots about
+  // level; with no IMU these are zero and the gimbal centers on the pure servo neutral.
 
   let mut ticker = Ticker::every(SERVO_PERIOD);
   let center =
@@ -442,7 +468,9 @@ async fn servo_task(pan_pwm: SimplePwm<'static>, tilt_pwm: SimplePwm<'static>, h
 
 /// Converts a boot IMU home angle into a center-trim in us, rejecting an implausible angle. A present-but-garbage
 /// MPU-6050 can ACK yet return bogus accel; an angle beyond `MAX_HOME_DEG` is treated as zero trim (calibration
-/// suspect) and logged, rather than baking a large permanent center bias into the gimbal.
+/// suspect) and logged, rather than baking a large permanent center bias into the gimbal. f32 `as i32` truncates
+/// toward zero (no libm), so `round_to_i32` biases by +/-0.5 first. TODO: calibrate sign/scale on hardware.
+#[cfg(feature = "imu")]
 fn bounded_home_trim(deg: f32, axis: &str) -> i32 {
   if deg.abs() > MAX_HOME_DEG {
     applog::log_println!("IMU home {} {} deg exceeds +/-{} — ignoring trim", axis, deg, MAX_HOME_DEG);
